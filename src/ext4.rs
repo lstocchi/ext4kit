@@ -16,8 +16,13 @@ pub const EXT4_ROOT_INO: u32 = 2;
 pub const EXT4_FIRST_INO: u32 = 11;
 
 // File Types
+pub const EXT4_FT_UNKNOWN: u8 = 0;
 pub const EXT4_FT_REG_FILE: u8 = 1;
 pub const EXT4_FT_DIR: u8 = 2;
+pub const EXT4_FT_CHRDEV: u8 = 3;
+pub const EXT4_FT_BLKDEV: u8 = 4;
+pub const EXT4_FT_FIFO: u8 = 5;
+pub const EXT4_FT_SOCK: u8 = 6;
 pub const EXT4_FT_SYMLINK: u8 = 7;
 
 pub const EXT4_EXTENTS_FL: u32 = 0x80000;
@@ -31,10 +36,14 @@ pub const EXT4_XATTR_INDEX_TRUSTED: u8 = 4;
 pub const EXT4_XATTR_INDEX_SECURITY: u8 = 6;
 pub const EXT4_XATTR_INDEX_SYSTEM: u8 = 7;
 
-// File Modes
-pub const S_IFREG: u16 = 0x8000;
-pub const S_IFDIR: u16 = 0x4000;
-pub const S_IFLNK: u16 = 0xA000;
+// File Modes (inode.i_mode type masks)
+pub const S_IFIFO: u16 = 0x1000; // Named pipe (FIFO)
+pub const S_IFCHR: u16 = 0x2000; // Character device
+pub const S_IFDIR: u16 = 0x4000; // Directory
+pub const S_IFBLK: u16 = 0x6000; // Block device
+pub const S_IFREG: u16 = 0x8000; // Regular file
+pub const S_IFLNK: u16 = 0xA000; // Symbolic link
+pub const S_IFSOCK: u16 = 0xC000; // Socket
 
 // Feature Flags
 // These are separate flags: INODE_UNINIT is 0x0001, while INODE_ZEROED is

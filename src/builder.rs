@@ -302,10 +302,13 @@ impl Ext4ImageBuilder {
         if extent_blocks == 0 {
             return Ok(());
         }
+        // Check for a contiguous run of free blocks for the file extent.
+        // Metadata blocks can be allocated anywhere.
         for delta in 0..self.groups.len() {
             let group = (preferred_group + delta) % self.groups.len();
             let mut run = 0u32;
             for bit in 0..self.groups[group].blocks_count as usize {
+                // if group is not used, increment run
                 if self.groups[group].block_bitmap[bit / 8] & (1 << (bit % 8)) == 0 {
                     run += 1;
                     if run == extent_blocks {

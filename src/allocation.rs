@@ -36,10 +36,4 @@ impl Ext4ImageBuilder {
             .find(|&ino| !self.is_inode_allocated(ino))
             .ok_or_else(|| anyhow::anyhow!("No free inodes available"))
     }
-
-    pub fn allocate_inode(&mut self, parent_dir_ino: Option<u32>) -> Result<u32> {
-        let ino = self.next_free_inode(parent_dir_ino)?;
-        self.mark_inode_used(ino);
-        Ok(ino)
-    }
 }
