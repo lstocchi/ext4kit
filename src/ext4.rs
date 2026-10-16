@@ -9,6 +9,11 @@ pub const BLOCK_SIZE: usize = 4096;
 pub const INODE_SIZE: usize = 256;
 pub const BYTES_PER_INODE_RATIO: usize = 4096;
 pub const BLOCKS_PER_GROUP: usize = 32768;
+pub const EXT4_EXTENTS_IN_INODE: usize = 4;
+pub const EXT4_EXTENTS_PER_BLOCK: usize =
+    (BLOCK_SIZE - std::mem::size_of::<Ext4ExtentHeader>()) / std::mem::size_of::<Ext4Extent>(); // 340
+pub const EXT4_INDEXES_PER_BLOCK: usize =
+    (BLOCK_SIZE - std::mem::size_of::<Ext4ExtentHeader>()) / std::mem::size_of::<Ext4ExtentIdx>(); // 340
 
 // Inode Numbers
 pub const EXT4_BAD_INO: u32 = 1;
@@ -197,6 +202,15 @@ impl Default for Ext4Inode {
     fn default() -> Self {
         unsafe { std::mem::zeroed() }
     }
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, Immutable, IntoBytes, KnownLayout)]
+pub struct Ext4ExtentIdx {
+    pub ei_block: u32,   // Subtree covers logical blocks starting from here
+    pub ei_leaf_lo: u32, // Physical block number of child node
+    pub ei_leaf_hi: u16, // High 16 bits of child block number
+    pub ei_unused: u16,
 }
 
 #[repr(C, packed)]

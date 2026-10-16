@@ -292,36 +292,21 @@ impl Ext4ImageBuilder {
     /// can be allocated before changing the block bitmap.
     pub(crate) fn ensure_allocation_capacity(
         &self,
-        preferred_group: usize,
         extent_blocks: u32,
         metadata_blocks: u32,
     ) -> Result<()> {
-        if self.superblock.s_free_blocks_count_lo < extent_blocks + metadata_blocks {
-            return Err(anyhow::anyhow!("not enough free blocks"));
+        let total_needed = extent_blocks
+            .checked_add(metadata_blocks)
+            .ok_or_else(|| anyhow::anyhow!("block allocation overflow"))?;
+
+        let free_blocks = self.superblock.s_free_blocks_count_lo;
+        if free_blocks < total_needed {
+            return Err(anyhow::anyhow!(
+                "not enough free blocks: needed {total_needed}, available {}",
+                free_blocks
+            ));
         }
-        if extent_blocks == 0 {
-            return Ok(());
-        }
-        // Check for a contiguous run of free blocks for the file extent.
-        // Metadata blocks can be allocated anywhere.
-        for delta in 0..self.groups.len() {
-            let group = (preferred_group + delta) % self.groups.len();
-            let mut run = 0u32;
-            for bit in 0..self.groups[group].blocks_count as usize {
-                // if group is not used, increment run
-                if self.groups[group].block_bitmap[bit / 8] & (1 << (bit % 8)) == 0 {
-                    run += 1;
-                    if run == extent_blocks {
-                        return Ok(());
-                    }
-                } else {
-                    run = 0;
-                }
-            }
-        }
-        Err(anyhow::anyhow!(
-            "no contiguous run of {extent_blocks} free blocks is available"
-        ))
+        Ok(())
     }
 
     pub fn create_root_dir(&mut self) -> Result<()> {
@@ -523,5 +508,139 @@ impl Ext4ImageBuilder {
         let mut file = File::create(output_path)?;
         file.write_all(&self.disk_data)?;
         Ok(())
+    }
+
+    /// Calculate maximum metadata blocks required for an extent tree.
+    pub fn max_extent_tree_blocks(num_extents: usize) -> usize {
+        if num_extents <= EXT4_EXTENTS_IN_INODE {
+            return 0;
+        }
+
+        // External leaf blocks (depth 0)
+        let leaf_blocks = num_extents.div_ceil(EXT4_EXTENTS_PER_BLOCK);
+        let mut total_metadata_blocks = leaf_blocks;
+
+        // Index blocks (depth 1+)
+        let mut current_index_entries = leaf_blocks;
+        while current_index_entries > EXT4_EXTENTS_IN_INODE {
+            let index_blocks = current_index_entries.div_ceil(EXT4_INDEXES_PER_BLOCK);
+            total_metadata_blocks += index_blocks;
+            current_index_entries = index_blocks;
+        }
+
+        total_metadata_blocks
+    }
+
+    /// Serializes an extent tree into the inode and external blocks.
+    /// Returns the number of external tree metadata blocks allocated.
+    pub(crate) fn write_extent_tree(
+        &mut self,
+        preferred_group: usize,
+        inode: &mut Ext4Inode,
+        leaf_extents: &[Ext4Extent],
+    ) -> Result<u32> {
+        // Depth 0: Extents fit entirely within the inode's 60-byte i_block
+        if leaf_extents.len() <= EXT4_EXTENTS_IN_INODE {
+            let header = Ext4ExtentHeader {
+                eh_magic: EXT4_EH_MAGIC,
+                eh_entries: leaf_extents.len() as u16,
+                eh_max: EXT4_EXTENTS_IN_INODE as u16,
+                eh_depth: 0,
+                eh_generation: 0,
+            };
+            inode.i_block[..12].copy_from_slice(header.as_bytes());
+            for (i, ext) in leaf_extents.iter().enumerate() {
+                let off = 12 + i * 12;
+                inode.i_block[off..off + 12].copy_from_slice(ext.as_bytes());
+            }
+            return Ok(0);
+        }
+
+        // Depth >= 1: Build bottom-up
+        let mut metadata_blocks_count = 0u32;
+        let mut current_indices = Vec::new();
+
+        // Level 0: External leaf blocks containing Ext4Extent
+        for chunk in leaf_extents.chunks(EXT4_EXTENTS_PER_BLOCK) {
+            let meta_blk = self.allocate_free_blocks(preferred_group, 1)?;
+            metadata_blocks_count += 1;
+
+            let mut block_data = vec![0u8; BLOCK_SIZE];
+            let header = Ext4ExtentHeader {
+                eh_magic: EXT4_EH_MAGIC,
+                eh_entries: chunk.len() as u16,
+                eh_max: EXT4_EXTENTS_PER_BLOCK as u16,
+                eh_depth: 0,
+                eh_generation: 0,
+            };
+            block_data[..12].copy_from_slice(header.as_bytes());
+            for (i, ext) in chunk.iter().enumerate() {
+                let off = 12 + i * 12;
+                block_data[off..off + 12].copy_from_slice(ext.as_bytes());
+            }
+
+            let disk_offset = meta_blk as usize * BLOCK_SIZE;
+            self.disk_data[disk_offset..disk_offset + BLOCK_SIZE].copy_from_slice(&block_data);
+
+            current_indices.push(Ext4ExtentIdx {
+                ei_block: chunk[0].ee_block,
+                ei_leaf_lo: meta_blk,
+                ei_leaf_hi: 0,
+                ei_unused: 0,
+            });
+        }
+
+        let mut current_depth = 1u16;
+
+        // Level 1+: External index blocks containing Ext4ExtentIdx
+        while current_indices.len() > EXT4_EXTENTS_IN_INODE {
+            let mut next_level_indices = Vec::new();
+            for chunk in current_indices.chunks(EXT4_EXTENTS_PER_BLOCK) {
+                let meta_blk = self.allocate_free_blocks(preferred_group, 1)?;
+                metadata_blocks_count += 1;
+
+                let mut block_data = vec![0u8; BLOCK_SIZE];
+                let header = Ext4ExtentHeader {
+                    eh_magic: EXT4_EH_MAGIC,
+                    eh_entries: chunk.len() as u16,
+                    eh_max: EXT4_EXTENTS_PER_BLOCK as u16,
+                    eh_depth: current_depth,
+                    eh_generation: 0,
+                };
+                block_data[..12].copy_from_slice(header.as_bytes());
+                for (i, idx) in chunk.iter().enumerate() {
+                    let off = 12 + i * 12;
+                    block_data[off..off + 12].copy_from_slice(idx.as_bytes());
+                }
+
+                let disk_offset = meta_blk as usize * BLOCK_SIZE;
+                self.disk_data[disk_offset..disk_offset + BLOCK_SIZE].copy_from_slice(&block_data);
+
+                next_level_indices.push(Ext4ExtentIdx {
+                    ei_block: chunk[0].ei_block,
+                    ei_leaf_lo: meta_blk,
+                    ei_leaf_hi: 0,
+                    ei_unused: 0,
+                });
+            }
+            current_indices = next_level_indices;
+            current_depth += 1;
+        }
+
+        // Write root index node into inode's i_block
+        let header = Ext4ExtentHeader {
+            eh_magic: EXT4_EH_MAGIC,
+            eh_entries: current_indices.len() as u16,
+            eh_max: EXT4_EXTENTS_IN_INODE as u16,
+            eh_depth: current_depth,
+            eh_generation: 0,
+        };
+        inode.i_block[..12].copy_from_slice(header.as_bytes());
+        for (i, idx) in current_indices.iter().enumerate() {
+            let off = 12 + i * 12;
+            inode.i_block[off..off + 12].copy_from_slice(idx.as_bytes());
+        }
+
+        Ok(metadata_blocks_count)
     }
 }

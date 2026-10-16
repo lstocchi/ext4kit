@@ -168,7 +168,7 @@ impl Ext4ImageBuilder {
         // it gets the group of the free inode found
         let (group, index_in_group) = self.inode_location(ino);
         // it ensures that the group has enough capacity to allocate the new inode
-        self.ensure_allocation_capacity(group, 1, u32::from(!xattrs.is_empty()))?;
+        self.ensure_allocation_capacity(1, u32::from(!xattrs.is_empty()))?;
         // allocate the inode
         self.mark_inode_used(ino);
 
@@ -219,6 +219,94 @@ impl Ext4ImageBuilder {
         Ok(ino)
     }
 
+    /// Non-mutating scan that plans the exact physical block runs for `blocks_needed`.
+    /// Each run is capped at 32,768 blocks to comply with ext4 initialized extent limits.
+    pub(crate) fn plan_data_blocks(
+        &self,
+        preferred_group: usize,
+        mut blocks_needed: u32,
+    ) -> Result<Vec<(u32, u32)>> {
+        if blocks_needed == 0 {
+            return Ok(Vec::new());
+        }
+
+        let free_blocks = self.superblock.s_free_blocks_count_lo;
+        if free_blocks < blocks_needed {
+            return Err(anyhow::anyhow!(
+                "not enough free blocks: needed {blocks_needed}, available {}",
+                free_blocks
+            ));
+        }
+
+        let mut planned_runs = Vec::new();
+        let total_groups = self.groups.len();
+
+        for delta in 0..total_groups {
+            if blocks_needed == 0 {
+                break;
+            }
+            let group = (preferred_group + delta) % total_groups;
+            if self.groups[group].free_blocks_count == 0 {
+                continue;
+            }
+
+            let limit = self.groups[group].blocks_count as usize;
+            let mut bit = 0;
+
+            while bit < limit && blocks_needed > 0 {
+                // If block is free in bitmap
+                if self.groups[group].block_bitmap[bit / 8] & (1 << (bit % 8)) == 0 {
+                    let run_start = bit;
+                    let max_run = (blocks_needed.min(32768) as usize).min(limit - run_start);
+                    let mut run_len = 0;
+
+                    while run_len < max_run
+                        && (self.groups[group].block_bitmap[(run_start + run_len) / 8]
+                            & (1 << ((run_start + run_len) % 8)))
+                            == 0
+                    {
+                        run_len += 1;
+                    }
+
+                    if run_len > 0 {
+                        let phys_block = (group * BLOCKS_PER_GROUP + run_start) as u32;
+                        planned_runs.push((phys_block, run_len as u32));
+                        blocks_needed -= run_len as u32;
+                        bit = run_start + run_len;
+                    } else {
+                        bit += 1;
+                    }
+                } else {
+                    bit += 1;
+                }
+            }
+        }
+
+        if blocks_needed > 0 {
+            return Err(anyhow::anyhow!(
+                "insufficient contiguous blocks to fulfill allocation"
+            ));
+        }
+
+        Ok(planned_runs)
+    }
+
+    /// Commits previously planned runs into the block bitmaps and descriptors.
+    pub(crate) fn commit_data_blocks(&mut self, planned_runs: &[(u32, u32)]) {
+        for &(phys_start, len) in planned_runs {
+            let group = (phys_start as usize) / BLOCKS_PER_GROUP;
+            let local_start = (phys_start as usize) % BLOCKS_PER_GROUP;
+
+            for idx in local_start..local_start + len as usize {
+                self.groups[group].block_bitmap[idx / 8] |= 1 << (idx % 8);
+            }
+
+            self.groups[group].free_blocks_count -= len as u16;
+            self.group_descriptors[group].bg_free_blocks_count_lo -= len as u16;
+            self.superblock.s_free_blocks_count_lo -= len;
+        }
+    }
+
     /// Create a regular file with one contiguous, depth-zero extent.
     pub fn add_file(
         &mut self,
@@ -230,49 +318,77 @@ impl Ext4ImageBuilder {
         Self::validate_name(name)?;
         self.ensure_dir_entry_creatable(parent, name)?;
 
-        let blocks_needed = data.len().div_ceil(BLOCK_SIZE);
-        if blocks_needed > BLOCKS_PER_GROUP {
-            return Err(anyhow::anyhow!("file is too large for a single extent"));
-        }
-
+        let blocks_needed = data.len().div_ceil(BLOCK_SIZE) as u32;
         let xattrs = prepare_xattrs(&meta.xattrs)?;
 
         // it finds the next free inode starting from the block of the parent directory, but still do not allocate it
         let ino = self.next_free_inode(Some(parent))?;
         // it gets the group of the free inode found
         let (group, index_in_group) = self.inode_location(ino);
-        // it ensures that the group has enough capacity to allocate the new inode
-        self.ensure_allocation_capacity(
-            group,
-            blocks_needed as u32,
-            u32::from(!xattrs.is_empty()),
-        )?;
-        // allocate the inode
-        self.mark_inode_used(ino);
-        let data_extent_start_block = if blocks_needed == 0 {
-            0
-        } else {
-            self.allocate_free_blocks(group, blocks_needed as u32)?
-        };
 
-        if !data.is_empty() {
-            let offset = data_extent_start_block as usize * BLOCK_SIZE;
-            self.disk_data[offset..offset + data.len()].copy_from_slice(data);
+        // it plans the data blocks to be allocated
+        let planned_runs = self.plan_data_blocks(group, blocks_needed)?;
+
+        // Extent count is known exactly from the planned runs
+        let exact_tree_meta_blocks = Self::max_extent_tree_blocks(planned_runs.len()) as u32;
+        let xattr_blocks = u32::from(!xattrs.is_empty());
+        let metadata_blocks_required = exact_tree_meta_blocks
+            .checked_add(xattr_blocks)
+            .ok_or_else(|| anyhow::anyhow!("block allocation count overflow"))?;
+
+        // it ensures that the group has enough capacity to allocate the new inode
+        self.ensure_allocation_capacity(blocks_needed as u32, metadata_blocks_required)?;
+
+        // allocate the inode and commit the data blocks
+        self.mark_inode_used(ino);
+        self.commit_data_blocks(&planned_runs);
+
+        // Write payload data into the runs
+        let mut data_offset = 0;
+        for &(phys_start, len) in &planned_runs {
+            if data_offset >= data.len() {
+                break;
+            }
+            let chunk_size = ((len as usize) * BLOCK_SIZE).min(data.len() - data_offset);
+            let disk_offset = phys_start as usize * BLOCK_SIZE;
+            self.disk_data[disk_offset..disk_offset + chunk_size]
+                .copy_from_slice(&data[data_offset..data_offset + chunk_size]);
+            data_offset += chunk_size;
+        }
+
+        let mut leaf_extents = Vec::with_capacity(planned_runs.len());
+        let mut current_logical = 0u32;
+        for &(phys_start, len) in &planned_runs {
+            leaf_extents.push(Ext4Extent {
+                ee_block: current_logical,
+                ee_len: len as u16,
+                ee_start_hi: 0,
+                ee_start_lo: phys_start,
+            });
+            current_logical += len;
         }
 
         let mut inode = Ext4Inode::default();
         Self::populate_inode_metadata(&mut inode, meta, S_IFREG, 0o644);
-        inode.i_size_lo =
-            u32::try_from(data.len()).map_err(|_| anyhow::anyhow!("file is larger than 4 GiB"))?;
+        inode.i_size_lo = (data.len() & 0xFFFF_FFFF) as u32;
+        inode.i_size_high = (data.len() >> 32) as u32;
         inode.i_links_count = 1;
-        inode.i_blocks_lo = blocks_needed as u32 * (BLOCK_SIZE / 512) as u32;
         inode.i_flags = EXT4_EXTENTS_FL;
 
-        init_single_extent(&mut inode, blocks_needed as u16, data_extent_start_block);
+        let tree_meta_blocks = self.write_extent_tree(group, &mut inode, &leaf_extents)?;
+
+        // Total 512-byte sectors: data + tree metadata blocks
+        let mut total_sectors =
+            (blocks_needed as u64 + tree_meta_blocks as u64) * (BLOCK_SIZE as u64 / 512);
+
         if !xattrs.is_empty() {
             inode.i_file_acl_lo = self.write_prepared_xattr_block(group, &xattrs)?;
-            inode.i_blocks_lo += (BLOCK_SIZE / 512) as u32;
+            total_sectors += BLOCK_SIZE as u64 / 512;
         }
+
+        inode.i_blocks_lo = total_sectors as u32;
+        let high_sectors = (total_sectors >> 32) as u16;
+        inode.i_osd2[0..2].copy_from_slice(&high_sectors.to_le_bytes());
 
         self.groups[group].inode_table[index_in_group] = inode;
         self.add_dir_entry(parent, name, ino, EXT4_FT_REG_FILE)?;
@@ -380,7 +496,7 @@ impl Ext4ImageBuilder {
         // it gets the group of the free inode found
         let (group, index_in_group) = self.inode_location(ino);
         // it ensures that the group has enough capacity to allocate the new inode
-        self.ensure_allocation_capacity(group, block_needed as u32, u32::from(!xattrs.is_empty()))?;
+        self.ensure_allocation_capacity(block_needed as u32, u32::from(!xattrs.is_empty()))?;
 
         // allocate the inode
         self.mark_inode_used(ino);
@@ -440,7 +556,7 @@ impl Ext4ImageBuilder {
         // it gets the group of the free inode found
         let (group, index_in_group) = self.inode_location(ino);
         // it ensures that the group has enough capacity to allocate the new inode
-        self.ensure_allocation_capacity(group, 0, u32::from(!xattrs.is_empty()))?;
+        self.ensure_allocation_capacity(0, u32::from(!xattrs.is_empty()))?;
         // allocate the inode
         self.mark_inode_used(ino);
 
@@ -920,5 +1036,72 @@ mod tests {
     fn device_numbers_must_fit_linux_dev_t() {
         assert!(encode_device_number(0x1000, 0).is_err());
         assert!(encode_device_number(0, 0x10_0000).is_err());
+    }
+
+    #[test]
+    fn multi_extent_tree_depth_1_verification() {
+        let mut builder = fresh_builder().expect("failed to create builder");
+        let meta = PosixMetadata::default();
+
+        // Artificially fragment free blocks to force >= 5 extents
+        // Group 0 has some free blocks. We allocate single blocks with gaps.
+        let mut fragmented_blocks = Vec::new();
+        for _ in 0..5 {
+            let blk = builder.allocate_free_blocks(0, 1).unwrap();
+            fragmented_blocks.push(blk);
+            let _gap = builder.allocate_free_blocks(0, 1).unwrap();
+        }
+
+        // Free the 5 blocks we want to use as fragmented targets
+        for &blk in &fragmented_blocks {
+            let local = blk as usize % BLOCKS_PER_GROUP;
+            builder.groups[0].block_bitmap[local / 8] &= !(1 << (local % 8));
+            builder.groups[0].free_blocks_count += 1;
+            builder.superblock.s_free_blocks_count_lo += 1;
+        }
+
+        // Allocate a 5-block file that will consume the 5 isolated gaps
+        let file_data = vec![0xABu8; 5 * BLOCK_SIZE];
+        let ino = builder
+            .add_file(EXT4_ROOT_INO, "fragmented.bin", &file_data, &meta)
+            .expect("should create fragmented file");
+
+        let (grp, idx) = builder.inode_location(ino);
+        let inode = &builder.groups[grp].inode_table[idx];
+
+        // Root inode must now be at depth 1 with 1 index entry
+        let root_hdr = Ext4ExtentHeader::read_from_bytes(&inode.i_block[..12]).unwrap();
+
+        let root_magic = root_hdr.eh_magic;
+        let root_depth = root_hdr.eh_depth;
+        let root_entries = root_hdr.eh_entries;
+        let root_max = root_hdr.eh_max;
+        assert_eq!(root_magic, EXT4_EH_MAGIC);
+        assert_eq!(root_depth, 1);
+        assert_eq!(root_entries, 1);
+        assert_eq!(root_max, 4);
+
+        let root_idx = Ext4ExtentIdx::read_from_bytes(&inode.i_block[12..24]).unwrap();
+        let root_index = root_idx.ei_block;
+        assert_eq!(root_index, 0);
+
+        // Inspect the external leaf block pointed to by ei_leaf_lo
+        let leaf_blk_offset = root_idx.ei_leaf_lo as usize * BLOCK_SIZE;
+        let leaf_hdr = Ext4ExtentHeader::read_from_bytes(
+            &builder.disk_data[leaf_blk_offset..leaf_blk_offset + 12],
+        )
+        .unwrap();
+        let leaf_magic = leaf_hdr.eh_magic;
+        let leaf_depth = leaf_hdr.eh_depth;
+        let leaf_entries = leaf_hdr.eh_entries;
+        let leaf_max = leaf_hdr.eh_max;
+        assert_eq!(leaf_magic, EXT4_EH_MAGIC);
+        assert_eq!(leaf_depth, 0);
+        assert_eq!(leaf_entries, 5);
+        assert_eq!(leaf_max, 340);
+
+        // Accounted sectors: 5 data blocks + 1 extent tree block = 6 blocks * 8 sectors = 48
+        let inode_blocks_lo = inode.i_blocks_lo;
+        assert_eq!(inode_blocks_lo, 48);
     }
 }
