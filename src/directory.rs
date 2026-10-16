@@ -22,6 +22,18 @@ struct PreparedXattr {
     value: Vec<u8>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum DirSlot {
+    /// An active directory entry with slack space that can be split.
+    Split {
+        offset: usize,
+        actual: usize,
+        rec_len: usize,
+    },
+    /// An unused/empty entry (inode == 0) that can be reused directly.
+    Reuse { offset: usize, rec_len: usize },
+}
+
 impl Ext4ImageBuilder {
     fn validate_name(name: &str) -> Result<()> {
         if name.is_empty() || name == "." || name == ".." || name.len() > 255 || name.contains('/')
@@ -55,84 +67,6 @@ impl Ext4ImageBuilder {
             .ee_start_lo)
     }
 
-    pub fn add_dir_entry(
-        &mut self,
-        parent: u32,
-        name: &str,
-        child: u32,
-        file_type: u8,
-    ) -> Result<()> {
-        Self::validate_name(name)?;
-        let (base, off, actual) = self.find_dir_entry_slot(parent, name)?;
-        let bytes = name.as_bytes();
-        // it copy the actual length of the last old entry to its rec_len field
-        self.disk_data[base + off + 4..base + off + 6]
-            .copy_from_slice(&(actual as u16).to_le_bytes());
-
-        let new_offset = off + actual;
-        self.disk_data[base + new_offset..base + new_offset + 8].copy_from_slice(
-            Ext4DirEntry2Header {
-                inode: child,
-                rec_len: (BLOCK_SIZE - new_offset) as u16,
-                name_len: bytes.len() as u8,
-                file_type,
-            }
-            .as_bytes(),
-        );
-        self.disk_data[base + new_offset + 8..base + new_offset + 8 + bytes.len()]
-            .copy_from_slice(bytes);
-        Ok(())
-    }
-
-    /// Preflight check: verifies that the name is valid, does not already exist
-    /// in the parent directory, and that the directory block has enough space.
-    fn ensure_dir_entry_creatable(&self, parent: u32, name: &str) -> Result<()> {
-        self.find_dir_entry_slot(parent, name).map(|_| ())
-    }
-
-    /// Finds and returns the precise byte offsets `(base, off, actual)` for inserting
-    /// a new entry into the parent directory block.
-    fn find_dir_entry_slot(&self, parent: u32, name: &str) -> Result<(usize, usize, usize)> {
-        //Self::validate_name(name)?;
-        Self::validate_name(name)?;
-        let base = self.read_dir_block_index(parent)? as usize * BLOCK_SIZE;
-        let bytes = name.as_bytes();
-        let needed = align4(8 + bytes.len());
-        let mut off = 0;
-
-        while off < BLOCK_SIZE {
-            let e =
-                Ext4DirEntry2Header::read_from_bytes(&self.disk_data[base + off..base + off + 8])
-                    .map_err(|_| anyhow::anyhow!("invalid directory entry"))?;
-            let len = e.rec_len as usize;
-            // TODO: to verify .... is it really useful? we're checking an already added entry. So i assume the check has been done at insertion
-            if len < 8 || len % 4 != 0 || off + len > BLOCK_SIZE || e.name_len as usize + 8 > len {
-                return Err(anyhow::anyhow!(
-                    "directory inode {parent} has an invalid record"
-                ));
-            }
-            if e.inode != 0
-                && &self.disk_data[base + off + 8..base + off + 8 + e.name_len as usize] == bytes
-            {
-                return Err(anyhow::anyhow!("directory entry {name:?} already exists"));
-            }
-            if off + len == BLOCK_SIZE {
-                let actual = align4(8 + e.name_len as usize);
-                if len - actual < needed {
-                    return Err(anyhow::anyhow!(
-                        "directory inode {parent} has no space for {name:?}"
-                    ));
-                }
-                return Ok((base, off, actual));
-            }
-            off += len;
-        }
-
-        Err(anyhow::anyhow!(
-            "directory inode {parent} has no terminal entry"
-        ))
-    }
-
     /// Populates an in-memory Ext4Inode with POSIX metadata fields.
     fn populate_inode_metadata(
         inode: &mut Ext4Inode,
@@ -158,7 +92,8 @@ impl Ext4ImageBuilder {
 
     pub fn mkdir(&mut self, parent: u32, name: &str, meta: Option<&PosixMetadata>) -> Result<u32> {
         Self::validate_name(name)?;
-        self.ensure_dir_entry_creatable(parent, name)?;
+
+        let expansion_blocks = self.dir_expansion_blocks_required(parent, name)?;
 
         let default_meta = PosixMetadata::default();
         let meta = meta.unwrap_or(&default_meta);
@@ -168,7 +103,7 @@ impl Ext4ImageBuilder {
         // it gets the group of the free inode found
         let (group, index_in_group) = self.inode_location(ino);
         // it ensures that the group has enough capacity to allocate the new inode
-        self.ensure_allocation_capacity(1, u32::from(!xattrs.is_empty()))?;
+        self.ensure_allocation_capacity(1 + expansion_blocks, u32::from(!xattrs.is_empty()))?;
         // allocate the inode
         self.mark_inode_used(ino);
 
@@ -316,7 +251,8 @@ impl Ext4ImageBuilder {
         meta: &PosixMetadata,
     ) -> Result<u32> {
         Self::validate_name(name)?;
-        self.ensure_dir_entry_creatable(parent, name)?;
+
+        let expansion_blocks = self.dir_expansion_blocks_required(parent, name)?;
 
         let blocks_needed = data.len().div_ceil(BLOCK_SIZE) as u32;
         let xattrs = prepare_xattrs(&meta.xattrs)?;
@@ -337,7 +273,10 @@ impl Ext4ImageBuilder {
             .ok_or_else(|| anyhow::anyhow!("block allocation count overflow"))?;
 
         // it ensures that the group has enough capacity to allocate the new inode
-        self.ensure_allocation_capacity(blocks_needed as u32, metadata_blocks_required)?;
+        self.ensure_allocation_capacity(
+            blocks_needed as u32 + expansion_blocks,
+            metadata_blocks_required,
+        )?;
 
         // allocate the inode and commit the data blocks
         self.mark_inode_used(ino);
@@ -473,7 +412,7 @@ impl Ext4ImageBuilder {
         meta: &PosixMetadata,
     ) -> Result<u32> {
         Self::validate_name(name)?;
-        self.ensure_dir_entry_creatable(parent, name)?;
+        let expansion_blocks = self.dir_expansion_blocks_required(parent, name)?;
 
         let target_bytes = target.as_bytes();
         // Match ext2fs_symlink(): the terminating NUL must fit in one block,
@@ -496,7 +435,10 @@ impl Ext4ImageBuilder {
         // it gets the group of the free inode found
         let (group, index_in_group) = self.inode_location(ino);
         // it ensures that the group has enough capacity to allocate the new inode
-        self.ensure_allocation_capacity(block_needed as u32, u32::from(!xattrs.is_empty()))?;
+        self.ensure_allocation_capacity(
+            block_needed as u32 + expansion_blocks,
+            u32::from(!xattrs.is_empty()),
+        )?;
 
         // allocate the inode
         self.mark_inode_used(ino);
@@ -549,14 +491,15 @@ impl Ext4ImageBuilder {
         meta: &PosixMetadata,
     ) -> Result<u32> {
         Self::validate_name(name)?;
-        self.ensure_dir_entry_creatable(parent, name)?;
+        let expansion_blocks = self.dir_expansion_blocks_required(parent, name)?;
+
         let xattrs = prepare_xattrs(&meta.xattrs)?;
         // it finds the next free inode starting from the block of the parent directory, but still do not allocate it
         let ino = self.next_free_inode(Some(parent))?;
         // it gets the group of the free inode found
         let (group, index_in_group) = self.inode_location(ino);
         // it ensures that the group has enough capacity to allocate the new inode
-        self.ensure_allocation_capacity(0, u32::from(!xattrs.is_empty()))?;
+        self.ensure_allocation_capacity(expansion_blocks, u32::from(!xattrs.is_empty()))?;
         // allocate the inode
         self.mark_inode_used(ino);
 
@@ -612,6 +555,303 @@ impl Ext4ImageBuilder {
     /// Creates a Unix domain socket.
     pub fn add_socket(&mut self, parent: u32, name: &str, meta: &PosixMetadata) -> Result<u32> {
         self.add_special_file(parent, name, S_IFSOCK, 0o777, EXT4_FT_SOCK, [0u8; 60], meta)
+    }
+
+    /// Recursively collects all leaf extents from an extent tree root or node block.
+    fn collect_leaf_extents(&self, block_data: &[u8], extents: &mut Vec<Ext4Extent>) -> Result<()> {
+        let header = Ext4ExtentHeader::read_from_bytes(&block_data[..12])
+            .map_err(|_| anyhow::anyhow!("invalid extent header"))?;
+        if header.eh_magic != EXT4_EH_MAGIC {
+            return Err(anyhow::anyhow!("invalid extent magic"));
+        }
+        let entries = header.eh_entries as usize;
+        if header.eh_depth == 0 {
+            for i in 0..entries {
+                let off = 12 + i * 12;
+                let ext = Ext4Extent::read_from_bytes(&block_data[off..off + 12])
+                    .map_err(|_| anyhow::anyhow!("invalid extent record"))?;
+                extents.push(ext);
+            }
+        } else {
+            for i in 0..entries {
+                let off = 12 + i * 12;
+                let idx = Ext4ExtentIdx::read_from_bytes(&block_data[off..off + 12])
+                    .map_err(|_| anyhow::anyhow!("invalid extent index"))?;
+                let blk = idx.ei_leaf_lo as usize;
+                let offset = blk * BLOCK_SIZE;
+                self.collect_leaf_extents(&self.disk_data[offset..offset + BLOCK_SIZE], extents)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Collects the external extent-tree blocks reachable from a tree root.
+    fn collect_extent_tree_blocks(&self, block_data: &[u8], blocks: &mut Vec<u32>) -> Result<()> {
+        let header = Ext4ExtentHeader::read_from_bytes(&block_data[..12])
+            .map_err(|_| anyhow::anyhow!("invalid extent header"))?;
+        if header.eh_magic != EXT4_EH_MAGIC {
+            return Err(anyhow::anyhow!("invalid extent magic"));
+        }
+        if header.eh_depth == 0 {
+            return Ok(());
+        }
+        for i in 0..header.eh_entries as usize {
+            let off = 12 + i * 12;
+            let idx = Ext4ExtentIdx::read_from_bytes(&block_data[off..off + 12])
+                .map_err(|_| anyhow::anyhow!("invalid extent index"))?;
+            let block = idx.ei_leaf_lo;
+            blocks.push(block);
+            let data_offset = block as usize * BLOCK_SIZE;
+            self.collect_extent_tree_blocks(
+                &self.disk_data[data_offset..data_offset + BLOCK_SIZE],
+                blocks,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Reads all leaf extents associated with an inode.
+    pub(crate) fn get_inode_extents(&self, inode: &Ext4Inode) -> Result<Vec<Ext4Extent>> {
+        let mut extents = Vec::new();
+        self.collect_leaf_extents(&inode.i_block, &mut extents)?;
+        Ok(extents)
+    }
+
+    /// Returns the physical block numbers belonging to a directory in logical order.
+    pub(crate) fn get_dir_blocks(&self, ino: u32) -> Result<Vec<u32>> {
+        if !self.is_inode_allocated(ino) {
+            return Err(anyhow::anyhow!("inode {ino} does not exist"));
+        }
+        let (g, i) = self.inode_location(ino);
+        let inode = &self.groups[g].inode_table[i];
+        if inode.i_mode & S_IFDIR != S_IFDIR {
+            return Err(anyhow::anyhow!("inode {ino} is not a directory"));
+        }
+        if inode.i_flags & EXT4_EXTENTS_FL == 0 {
+            return Err(anyhow::anyhow!(
+                "directory inode {ino} does not use extents"
+            ));
+        }
+        let extents = self.get_inode_extents(inode)?;
+        let mut blocks = Vec::new();
+        for ext in extents {
+            for b in 0..ext.ee_len {
+                blocks.push(ext.ee_start_lo + b as u32);
+            }
+        }
+        Ok(blocks)
+    }
+
+    /// Scans all directory blocks to verify `name` is unique, finding an available slot.
+    fn find_dir_slot(&self, parent: u32, name: &str) -> Result<Option<DirSlot>> {
+        Self::validate_name(name)?;
+        let name_bytes = name.as_bytes();
+        let needed = align4(8 + name_bytes.len());
+        let blocks = self.get_dir_blocks(parent)?;
+        let mut found_slot = None;
+
+        for &block in &blocks {
+            let base = block as usize * BLOCK_SIZE;
+            let mut off = 0;
+            while off < BLOCK_SIZE {
+                let e = Ext4DirEntry2Header::read_from_bytes(
+                    &self.disk_data[base + off..base + off + 8],
+                )
+                .map_err(|_| anyhow::anyhow!("invalid directory entry header"))?;
+                let len = e.rec_len as usize;
+                if len < 8
+                    || len % 4 != 0
+                    || off + len > BLOCK_SIZE
+                    || (e.inode != 0 && (e.name_len as usize + 8 > len))
+                {
+                    return Err(anyhow::anyhow!(
+                        "directory inode {parent} has an invalid record"
+                    ));
+                }
+
+                if e.inode != 0 {
+                    if e.name_len as usize == name_bytes.len()
+                        && &self.disk_data[base + off + 8..base + off + 8 + e.name_len as usize]
+                            == name_bytes
+                    {
+                        return Err(anyhow::anyhow!("directory entry {name:?} already exists"));
+                    }
+                    let actual = align4(8 + e.name_len as usize);
+                    if found_slot.is_none() && len >= actual + needed {
+                        found_slot = Some(DirSlot::Split {
+                            offset: base + off,
+                            actual,
+                            rec_len: len,
+                        });
+                    }
+                } else if found_slot.is_none() && len >= needed {
+                    found_slot = Some(DirSlot::Reuse {
+                        offset: base + off,
+                        rec_len: len,
+                    });
+                }
+                off += len;
+            }
+            if off != BLOCK_SIZE {
+                return Err(anyhow::anyhow!(
+                    "directory inode {parent} block did not end at block boundary"
+                ));
+            }
+        }
+        Ok(found_slot)
+    }
+
+    /// Allocates an additional block for a directory inode, matching `ext2fs_expand_dir`.
+    pub(crate) fn expand_dir(&mut self, dir_ino: u32) -> Result<u32> {
+        let (group, index_in_group) = self.inode_location(dir_ino);
+        let inode = &self.groups[group].inode_table[index_in_group];
+        if inode.i_mode & S_IFDIR != S_IFDIR {
+            return Err(anyhow::anyhow!("inode {dir_ino} is not a directory"));
+        }
+
+        let mut leaf_extents = self.get_inode_extents(inode)?;
+
+        let mut old_tree_blocks = Vec::new();
+        self.collect_extent_tree_blocks(&inode.i_block, &mut old_tree_blocks)?;
+
+        // write_extent_tree currently serializes a replacement tree, so reserve
+        // its full metadata footprint before modifying allocation state.
+        let existing_extents = leaf_extents.len();
+        let potential_extents = existing_extents + 1;
+        let potential_tree_meta = Self::max_extent_tree_blocks(potential_extents) as u32;
+
+        // Preflight check: one data block plus the full replacement tree.
+        self.ensure_allocation_capacity(1, potential_tree_meta)?;
+
+        // Allocate block and initialize with an empty entry covering the full block
+        let new_blk = self.allocate_free_blocks(group, 1)?;
+        let mut empty_dir_block = vec![0u8; BLOCK_SIZE];
+        let empty_header = Ext4DirEntry2Header {
+            inode: 0,
+            rec_len: BLOCK_SIZE as u16,
+            name_len: 0,
+            file_type: 0,
+        };
+        empty_dir_block[..8].copy_from_slice(empty_header.as_bytes());
+        let disk_offset = new_blk as usize * BLOCK_SIZE;
+        self.disk_data[disk_offset..disk_offset + BLOCK_SIZE].copy_from_slice(&empty_dir_block);
+
+        // Append to existing extent if contiguous, otherwise push a new extent
+        let current_size = self.groups[group].inode_table[index_in_group].i_size_lo;
+        let logical_block = current_size / BLOCK_SIZE as u32;
+
+        let mut merged = false;
+        if let Some(last) = leaf_extents.last_mut() {
+            if last.ee_start_lo + (last.ee_len as u32) == new_blk && (last.ee_len as usize) < 32768
+            {
+                last.ee_len += 1;
+                merged = true;
+            }
+        }
+        if !merged {
+            leaf_extents.push(Ext4Extent {
+                ee_block: logical_block,
+                ee_len: 1,
+                ee_start_hi: 0,
+                ee_start_lo: new_blk,
+            });
+        }
+
+        let mut dir_inode = self.groups[group].inode_table[index_in_group];
+        let tree_meta_blocks = self.write_extent_tree(group, &mut dir_inode, &leaf_extents)?;
+
+        // The replacement tree is now reachable from the inode; reclaim the
+        // old external tree blocks so repeated growth does not leak space.
+        for block in old_tree_blocks {
+            self.release_block(block)?;
+        }
+
+        dir_inode.i_size_lo += BLOCK_SIZE as u32;
+        let total_data_blocks = dir_inode.i_size_lo / BLOCK_SIZE as u32;
+        let xattr_blocks = u32::from(dir_inode.i_file_acl_lo != 0);
+        let total_sectors =
+            (total_data_blocks as u64 + tree_meta_blocks as u64 + xattr_blocks as u64)
+                * (BLOCK_SIZE as u64 / 512);
+        dir_inode.i_blocks_lo = total_sectors as u32;
+        let high_sectors = (total_sectors >> 32) as u16;
+        dir_inode.i_osd2[0..2].copy_from_slice(&high_sectors.to_le_bytes());
+
+        self.groups[group].inode_table[index_in_group] = dir_inode;
+        Ok(new_blk)
+    }
+
+    /// Adds a directory entry to `parent`. Expands the directory automatically
+    /// when all existing blocks are full.
+    pub fn add_dir_entry(
+        &mut self,
+        parent: u32,
+        name: &str,
+        child: u32,
+        file_type: u8,
+    ) -> Result<()> {
+        Self::validate_name(name)?;
+        let slot = match self.find_dir_slot(parent, name)? {
+            Some(slot) => slot,
+            None => {
+                self.expand_dir(parent)?;
+                self.find_dir_slot(parent, name)?.ok_or_else(|| {
+                    anyhow::anyhow!("failed to find slot after directory expansion")
+                })?
+            }
+        };
+
+        let bytes = name.as_bytes();
+        match slot {
+            DirSlot::Split {
+                offset,
+                actual,
+                rec_len,
+            } => {
+                self.disk_data[offset + 4..offset + 6]
+                    .copy_from_slice(&(actual as u16).to_le_bytes());
+                let new_offset = offset + actual;
+                let new_rec_len = (rec_len - actual) as u16;
+                self.disk_data[new_offset..new_offset + 8].copy_from_slice(
+                    Ext4DirEntry2Header {
+                        inode: child,
+                        rec_len: new_rec_len,
+                        name_len: bytes.len() as u8,
+                        file_type,
+                    }
+                    .as_bytes(),
+                );
+                self.disk_data[new_offset + 8..new_offset + 8 + bytes.len()].copy_from_slice(bytes);
+            }
+            DirSlot::Reuse { offset, rec_len } => {
+                self.disk_data[offset..offset + 8].copy_from_slice(
+                    Ext4DirEntry2Header {
+                        inode: child,
+                        rec_len: rec_len as u16,
+                        name_len: bytes.len() as u8,
+                        file_type,
+                    }
+                    .as_bytes(),
+                );
+                self.disk_data[offset + 8..offset + 8 + bytes.len()].copy_from_slice(bytes);
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns all blocks that must be reserved to grow a full directory.
+    /// This includes a conservative full replacement extent-tree footprint.
+    fn dir_expansion_blocks_required(&self, parent: u32, name: &str) -> Result<u32> {
+        Self::validate_name(name)?;
+        match self.find_dir_slot(parent, name)? {
+            Some(_) => Ok(0),
+            None => {
+                let (group, index) = self.inode_location(parent);
+                let extents = self.get_inode_extents(&self.groups[group].inode_table[index])?;
+                let tree_blocks = Self::max_extent_tree_blocks(extents.len() + 1) as u32;
+                1u32.checked_add(tree_blocks)
+                    .ok_or_else(|| anyhow::anyhow!("directory expansion allocation overflow"))
+            }
+        }
     }
 }
 
@@ -1103,5 +1343,120 @@ mod tests {
         // Accounted sectors: 5 data blocks + 1 extent tree block = 6 blocks * 8 sectors = 48
         let inode_blocks_lo = inode.i_blocks_lo;
         assert_eq!(inode_blocks_lo, 48);
+    }
+
+    #[test]
+    fn directory_expands_when_first_block_fills_up() {
+        let mut builder = fresh_builder().expect("failed to create builder");
+        let test_dir = builder
+            .mkdir(EXT4_ROOT_INO, "overflow_dir", None)
+            .expect("failed to create directory");
+
+        let (g, i) = builder.inode_location(test_dir);
+        let dir_inode = &builder.groups[g].inode_table[i];
+        let size_lo = u32::from_le_bytes(dir_inode.i_size_lo.to_le_bytes());
+        assert_eq!(size_lo, BLOCK_SIZE as u32);
+        let blocks_lo = u32::from_le_bytes(dir_inode.i_blocks_lo.to_le_bytes());
+        assert_eq!(blocks_lo, 8);
+
+        // With 12-char names (8-byte header + 12 name bytes = 20 bytes aligned),
+        // 4096 - 24 bytes for "." and ".." leaves 4072 bytes.
+        // 4072 / 20 = 203 files. File #204 exceeds block 0 and triggers expansion.
+        let meta = PosixMetadata::default();
+        for file_idx in 0..220 {
+            let fname = format!("file_{:07}", file_idx);
+            builder
+                .add_file(test_dir, &fname, b"content", &meta)
+                .unwrap_or_else(|e| panic!("failed to add {fname}: {e}"));
+        }
+
+        let dir_inode = &builder.groups[g].inode_table[i];
+        let size_lo = u32::from_le_bytes(dir_inode.i_size_lo.to_le_bytes());
+        assert_eq!(size_lo, (2 * BLOCK_SIZE) as u32);
+        let blocks_lo = u32::from_le_bytes(dir_inode.i_blocks_lo.to_le_bytes());
+        assert_eq!(blocks_lo, 16);
+
+        // Duplicate detection must work across both block 0 and block 1
+        assert!(
+            builder
+                .add_file(test_dir, "file_0000000", b"x", &meta)
+                .is_err()
+        );
+        assert!(
+            builder
+                .add_file(test_dir, "file_0000219", b"x", &meta)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn fragmented_directory_growth_reclaims_replaced_extent_trees() {
+        let mut builder = fresh_builder().expect("failed to create builder");
+        let directory = builder
+            .mkdir(EXT4_ROOT_INO, "fragmented_dir", None)
+            .expect("failed to create directory");
+        let free_before = builder.superblock.s_free_blocks_count_lo;
+        let meta = PosixMetadata::default();
+
+        // File data interleaves directory expansion, producing one directory
+        // extent per block. Six blocks force both creation and replacement of
+        // an external extent tree.
+        let entry_count = 203 + 4 * 204 + 1;
+        for file_idx in 0..entry_count {
+            builder
+                .add_file(directory, &format!("file_{file_idx:07}"), b"content", &meta)
+                .unwrap_or_else(|e| panic!("failed to add file {file_idx}: {e}"));
+        }
+
+        let (group, index) = builder.inode_location(directory);
+        let inode = &builder.groups[group].inode_table[index];
+        let inode_size = inode.i_size_lo;
+        assert_eq!(inode_size, 6 * BLOCK_SIZE as u32);
+        // Six directory data blocks plus exactly one live extent-tree block.
+        let inode_blocks = inode.i_blocks_lo;
+        assert_eq!(inode_blocks, 7 * (BLOCK_SIZE / 512) as u32);
+        assert_eq!(builder.get_inode_extents(inode).unwrap().len(), 6);
+        // Every file uses one data block; growth uses five more directory
+        // blocks and one extent-tree block, with no replaced-tree leaks.
+        assert_eq!(
+            free_before - builder.superblock.s_free_blocks_count_lo,
+            entry_count as u32 + 6
+        );
+    }
+
+    #[test]
+    fn directory_growth_preflight_reserves_extent_tree_metadata() {
+        let mut builder = fresh_builder().expect("failed to create builder");
+        let directory = builder
+            .mkdir(EXT4_ROOT_INO, "preflight_dir", None)
+            .expect("failed to create directory");
+        let meta = PosixMetadata::default();
+
+        // Fill four fragmented blocks. The next insertion needs a fifth data
+        // block and the first external extent-tree block.
+        for file_idx in 0..(203 + 3 * 204) {
+            builder
+                .add_file(directory, &format!("file_{file_idx:07}"), b"content", &meta)
+                .unwrap();
+        }
+        let (group, index) = builder.inode_location(directory);
+        let size_before = builder.groups[group].inode_table[index].i_size_lo;
+        let free_inodes_before = builder.superblock.s_free_inodes_count;
+
+        // Model an almost-full filesystem: insufficient for the child data,
+        // directory block, and tree metadata. The failure must occur before
+        // the child inode or either directory allocation is committed.
+        builder.superblock.s_free_blocks_count_lo = 2;
+        assert!(
+            builder
+                .add_file(directory, "requires_tree", b"content", &meta)
+                .is_err()
+        );
+        let free_inodes_after = builder.superblock.s_free_inodes_count;
+        let free_blocks_after = builder.superblock.s_free_blocks_count_lo;
+        assert_eq!(free_inodes_after, free_inodes_before);
+        assert_eq!(free_blocks_after, 2);
+        let size_after = builder.groups[group].inode_table[index].i_size_lo;
+        assert_eq!(size_after, size_before);
     }
 }

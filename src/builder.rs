@@ -288,6 +288,25 @@ impl Ext4ImageBuilder {
         ))
     }
 
+    /// Releases one previously allocated absolute block.
+    pub(crate) fn release_block(&mut self, block: u32) -> Result<()> {
+        let group = (block as usize) / BLOCKS_PER_GROUP;
+        let local = (block as usize) % BLOCKS_PER_GROUP;
+        if group >= self.groups.len() || local >= self.groups[group].blocks_count as usize {
+            return Err(anyhow::anyhow!("block {block} is outside the filesystem"));
+        }
+        let byte = local / 8;
+        let bit = local % 8;
+        if self.groups[group].block_bitmap[byte] & (1 << bit) == 0 {
+            return Err(anyhow::anyhow!("block {block} is not allocated"));
+        }
+        self.groups[group].block_bitmap[byte] &= !(1 << bit);
+        self.groups[group].free_blocks_count += 1;
+        self.group_descriptors[group].bg_free_blocks_count_lo += 1;
+        self.superblock.s_free_blocks_count_lo += 1;
+        Ok(())
+    }
+
     /// Prove that a file extent plus any separately allocated metadata block
     /// can be allocated before changing the block bitmap.
     pub(crate) fn ensure_allocation_capacity(

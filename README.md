@@ -47,8 +47,9 @@ The project currently creates a valid ext4 image containing:
   extent trees when required;
 - symbolic-link creation, using fast symlinks for targets shorter than 60 bytes
   and a single data-block extent for longer targets;
-- directory creation, including `.` / `..` entries and parent link-count
-  updates;
+- directory creation and automatic growth across multiple blocks, including
+  `.` / `..` entries, parent link-count updates, and fragmented
+  extent-backed directories;
 - character-device and block-device nodes, FIFOs, and Unix-domain socket
   nodes, with Linux-compatible device-number encoding;
 - POSIX metadata for created files and directories: permissions, 32-bit UID
@@ -111,9 +112,12 @@ Xattr keys use their fully qualified Linux names, such as `user.comment`,
 `security.capability`, `trusted.overlay.opaque`, and
 `system.posix_acl_access`. Xattrs currently use one unshared external 4 KiB
 block per inode; oversized xattr sets are rejected before filesystem
-allocation state is changed. Regular files may span fragmented runs; ext4
-extent-tree metadata is created automatically when their extents no longer fit
-in the inode. Symlink targets may be empty and are limited to `BLOCK_SIZE - 1`
+allocation state is changed. Regular files and directories may span fragmented
+runs; ext4 extent-tree metadata is created automatically when their extents no
+longer fit in the inode. Directory growth reserves both the new directory
+block and any required extent-tree metadata before creating the child entry,
+and reclaims replaced extent-tree blocks. Symlink targets may be empty and are
+limited to `BLOCK_SIZE - 1`
 bytes (4,095 bytes with the current 4 KiB block size). Targets shorter than 60
 bytes are stored directly in the inode; longer targets are stored in a single
 data block. Inline-data symlinks are not implemented.
@@ -139,7 +143,8 @@ should show them with type `120777` in `debugfs -R 'ls -l …'` output.
 Special files should appear as their corresponding Linux types, for example
 `20660` for a character device and `10644` for a FIFO. For fragmented files,
 `debugfs -R 'stat /path/to/file' output.img` can be used to inspect the extent
-tree.
+tree. Use `debugfs -R 'stat /path/to/directory' output.img` to confirm a
+grown directory's size, block count, and directory extents.
 
 ## Design constraints
 
@@ -150,10 +155,9 @@ tree.
 - The current implementation uses 32-bit block addresses and 32-byte group
   descriptors.
 - Images are deliberately created without a journal at this stage.
-- The formatter supports regular files (including fragmented multi-extent
-  files), directories, symlinks, device nodes, FIFOs, and sockets. It does not
-  yet create hard links or sparse files; directories still use a single data
-  block.
+- The formatter supports regular files and directories (including fragmented
+  multi-extent trees), symlinks, device nodes, FIFOs, and sockets. It does not
+  yet create hard links or sparse files.
 - Xattr block sharing/deduplication, inline xattrs, SELinux policy validation,
   and OCI whiteout semantics are not implemented.
 - UUID generation and OCI/host metadata extraction are still planned. The
