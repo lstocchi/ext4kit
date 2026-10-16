@@ -43,11 +43,14 @@ The project currently creates a valid ext4 image containing:
   tables;
 - initialized block and inode bitmaps, inode tables, the root directory, and
   `lost+found`.
-- regular-file creation with a single contiguous, depth-zero extent;
+- regular-file creation across fragmented block runs, with multi-level ext4
+  extent trees when required;
 - symbolic-link creation, using fast symlinks for targets shorter than 60 bytes
   and a single data-block extent for longer targets;
 - directory creation, including `.` / `..` entries and parent link-count
   updates;
+- character-device and block-device nodes, FIFOs, and Unix-domain socket
+  nodes, with Linux-compatible device-number encoding;
 - POSIX metadata for created files and directories: permissions, 32-bit UID
   and GID, and access/change/modification timestamps;
 - external ext4 xattr blocks, including deterministic entry ordering and
@@ -86,7 +89,7 @@ or host-directory import has not been implemented yet.
 
 ## Metadata API
 
-Library code supplies `PosixMetadata` to `add_file` and optionally to `mkdir`:
+Library code supplies `PosixMetadata` to creation methods:
 
 ```rust
 let metadata = PosixMetadata {
@@ -100,17 +103,25 @@ let metadata = PosixMetadata {
 let directory = builder.mkdir(EXT4_ROOT_INO, "app", Some(&metadata))?;
 builder.add_file(directory, "config", b"enabled=true\n", &metadata)?;
 builder.add_symlink(directory, "current", "config", &metadata)?;
+builder.add_char_device(directory, "null", 1, 3, &metadata)?;
+builder.add_fifo(directory, "events", &metadata)?;
 ```
 
 Xattr keys use their fully qualified Linux names, such as `user.comment`,
 `security.capability`, `trusted.overlay.opaque`, and
 `system.posix_acl_access`. Xattrs currently use one unshared external 4 KiB
 block per inode; oversized xattr sets are rejected before filesystem
-allocation state is changed. Regular files are similarly limited to one
-contiguous extent. Symlink targets may be empty and are limited to
-`BLOCK_SIZE - 1` bytes (4,095 bytes with the current 4 KiB block size).
-Targets shorter than 60 bytes are stored directly in the inode; longer targets
-are stored in a single data block. Inline-data symlinks are not implemented.
+allocation state is changed. Regular files may span fragmented runs; ext4
+extent-tree metadata is created automatically when their extents no longer fit
+in the inode. Symlink targets may be empty and are limited to `BLOCK_SIZE - 1`
+bytes (4,095 bytes with the current 4 KiB block size). Targets shorter than 60
+bytes are stored directly in the inode; longer targets are stored in a single
+data block. Inline-data symlinks are not implemented.
+
+`add_char_device` and `add_block_device` take Linux major and minor device
+numbers. The supported range is a major number up to 4,095 and a minor number
+up to 1,048,575. Special-file nodes do not allocate data extents, though they
+may have an external xattr block.
 
 ## Verify the image in Linux or WSL
 
@@ -125,6 +136,10 @@ debugfs -R 'ea_list /test_dir/hello.txt' output.img
 `e2fsck -fn` must complete without proposing repairs. `debugfs` should list
 `hello.txt` and display its `user.creator` xattr. Images containing symlinks
 should show them with type `120777` in `debugfs -R 'ls -l …'` output.
+Special files should appear as their corresponding Linux types, for example
+`20660` for a character device and `10644` for a FIFO. For fragmented files,
+`debugfs -R 'stat /path/to/file' output.img` can be used to inspect the extent
+tree.
 
 ## Design constraints
 
@@ -135,9 +150,10 @@ should show them with type `120777` in `debugfs -R 'ls -l …'` output.
 - The current implementation uses 32-bit block addresses and 32-byte group
   descriptors.
 - Images are deliberately created without a journal at this stage.
-- The formatter supports regular files, directories, and symlinks. It does not
-  yet create device nodes, FIFOs, sockets, hard links, sparse files, or
-  multi-extent files/directories.
+- The formatter supports regular files (including fragmented multi-extent
+  files), directories, symlinks, device nodes, FIFOs, and sockets. It does not
+  yet create hard links or sparse files; directories still use a single data
+  block.
 - Xattr block sharing/deduplication, inline xattrs, SELinux policy validation,
   and OCI whiteout semantics are not implemented.
 - UUID generation and OCI/host metadata extraction are still planned. The
