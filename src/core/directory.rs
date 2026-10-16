@@ -1,4 +1,9 @@
-use crate::{builder::Ext4ImageBuilder, ext4::*};
+use super::Ext4ImageBuilder;
+use crate::ext4::*;
+pub use crate::xattr::parse_xattr_name;
+#[cfg(test)]
+use crate::xattr::posix_acl_to_ext4_disk;
+use crate::xattr::prepare_xattrs;
 use anyhow::Result;
 use std::collections::HashMap;
 use zerocopy::{FromBytes, IntoBytes};
@@ -16,10 +21,10 @@ pub struct PosixMetadata {
 }
 
 #[derive(Clone, Debug)]
-struct PreparedXattr {
-    index: u8,
-    suffix: String,
-    value: Vec<u8>,
+pub(crate) struct PreparedXattr {
+    pub(crate) index: u8,
+    pub(crate) suffix: String,
+    pub(crate) value: Vec<u8>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -35,7 +40,8 @@ enum DirSlot {
 }
 
 impl Ext4ImageBuilder {
-    fn validate_name(name: &str) -> Result<()> {
+    /// Validates one ext4 directory-entry component; returns `Ok(())` or a descriptive error.
+    pub(crate) fn validate_name(name: &str) -> Result<()> {
         if name.is_empty() || name == "." || name == ".." || name.len() > 255 || name.contains('/')
         {
             Err(anyhow::anyhow!(
@@ -46,29 +52,8 @@ impl Ext4ImageBuilder {
         }
     }
 
-    fn read_dir_block_index(&self, ino: u32) -> Result<u32> {
-        if !self.is_inode_allocated(ino) {
-            return Err(anyhow::anyhow!("inode {ino} does not exist"));
-        }
-        let (g, i) = self.inode_location(ino);
-        let inode = &self.groups[g].inode_table[i];
-        if inode.i_mode & S_IFDIR != S_IFDIR {
-            return Err(anyhow::anyhow!("inode {ino} is not a directory"));
-        }
-        let h = Ext4ExtentHeader::read_from_bytes(&inode.i_block[..12])
-            .map_err(|_| anyhow::anyhow!("invalid extent header"))?;
-        if h.eh_magic != EXT4_EH_MAGIC || h.eh_depth != 0 || h.eh_entries != 1 {
-            return Err(anyhow::anyhow!(
-                "inode {ino} has an unsupported directory extent"
-            ));
-        }
-        Ok(Ext4Extent::read_from_bytes(&inode.i_block[12..24])
-            .map_err(|_| anyhow::anyhow!("invalid directory extent"))?
-            .ee_start_lo)
-    }
-
-    /// Populates an in-memory Ext4Inode with POSIX metadata fields.
-    fn populate_inode_metadata(
+    /// Applies POSIX metadata and file-type defaults to an inode; returns no value because it mutates in place.
+    pub(crate) fn populate_inode_metadata(
         inode: &mut Ext4Inode,
         m: &PosixMetadata,
         kind: u16,
@@ -90,6 +75,7 @@ impl Ext4ImageBuilder {
         inode.i_extra_isize = 32;
     }
 
+    /// Creates and links a directory below `parent`; returns its allocated inode number.
     pub fn mkdir(&mut self, parent: u32, name: &str, meta: Option<&PosixMetadata>) -> Result<u32> {
         Self::validate_name(name)?;
 
@@ -140,7 +126,7 @@ impl Ext4ImageBuilder {
         inode.i_flags = EXT4_EXTENTS_FL;
 
         Self::populate_inode_metadata(&mut inode, meta, S_IFDIR, 0o755);
-        init_single_extent(&mut inode, 1, data_block);
+        Self::init_single_extent(&mut inode, 1, data_block);
         if !xattrs.is_empty() {
             inode.i_file_acl_lo = self.write_prepared_xattr_block(group, &xattrs)?;
             inode.i_blocks_lo += (BLOCK_SIZE / 512) as u32;
@@ -156,6 +142,7 @@ impl Ext4ImageBuilder {
 
     /// Non-mutating scan that plans the exact physical block runs for `blocks_needed`.
     /// Each run is capped at 32,768 blocks to comply with ext4 initialized extent limits.
+    /// Plans uncommitted physical block runs for a payload; returns contiguous `(start, length)` runs.
     pub(crate) fn plan_data_blocks(
         &self,
         preferred_group: usize,
@@ -226,7 +213,7 @@ impl Ext4ImageBuilder {
         Ok(planned_runs)
     }
 
-    /// Commits previously planned runs into the block bitmaps and descriptors.
+    /// Marks previously planned runs allocated; returns no value because allocation state is mutated.
     pub(crate) fn commit_data_blocks(&mut self, planned_runs: &[(u32, u32)]) {
         for &(phys_start, len) in planned_runs {
             let group = (phys_start as usize) / BLOCKS_PER_GROUP;
@@ -242,407 +229,8 @@ impl Ext4ImageBuilder {
         }
     }
 
-    /// Create a regular file with one contiguous, depth-zero extent.
-    pub fn add_file(
-        &mut self,
-        parent: u32,
-        name: &str,
-        data: &[u8],
-        meta: &PosixMetadata,
-    ) -> Result<u32> {
-        Self::validate_name(name)?;
-
-        let expansion_blocks = self.dir_expansion_blocks_required(parent, name)?;
-
-        let blocks_needed = data.len().div_ceil(BLOCK_SIZE) as u32;
-        let xattrs = prepare_xattrs(&meta.xattrs)?;
-
-        // it finds the next free inode starting from the block of the parent directory, but still do not allocate it
-        let ino = self.next_free_inode(Some(parent))?;
-        // it gets the group of the free inode found
-        let (group, index_in_group) = self.inode_location(ino);
-
-        // it plans the data blocks to be allocated
-        let planned_runs = self.plan_data_blocks(group, blocks_needed)?;
-
-        // Extent count is known exactly from the planned runs
-        let exact_tree_meta_blocks = Self::max_extent_tree_blocks(planned_runs.len()) as u32;
-        let xattr_blocks = u32::from(!xattrs.is_empty());
-        let metadata_blocks_required = exact_tree_meta_blocks
-            .checked_add(xattr_blocks)
-            .ok_or_else(|| anyhow::anyhow!("block allocation count overflow"))?;
-
-        // it ensures that the group has enough capacity to allocate the new inode
-        self.ensure_allocation_capacity(
-            blocks_needed as u32 + expansion_blocks,
-            metadata_blocks_required,
-        )?;
-
-        // allocate the inode and commit the data blocks
-        self.mark_inode_used(ino);
-        self.commit_data_blocks(&planned_runs);
-
-        // Write payload data into the runs
-        let mut data_offset = 0;
-        for &(phys_start, len) in &planned_runs {
-            if data_offset >= data.len() {
-                break;
-            }
-            let chunk_size = ((len as usize) * BLOCK_SIZE).min(data.len() - data_offset);
-            let disk_offset = phys_start as usize * BLOCK_SIZE;
-            self.disk_data[disk_offset..disk_offset + chunk_size]
-                .copy_from_slice(&data[data_offset..data_offset + chunk_size]);
-            data_offset += chunk_size;
-        }
-
-        let mut leaf_extents = Vec::with_capacity(planned_runs.len());
-        let mut current_logical = 0u32;
-        for &(phys_start, len) in &planned_runs {
-            leaf_extents.push(Ext4Extent {
-                ee_block: current_logical,
-                ee_len: len as u16,
-                ee_start_hi: 0,
-                ee_start_lo: phys_start,
-            });
-            current_logical += len;
-        }
-
-        let mut inode = Ext4Inode::default();
-        Self::populate_inode_metadata(&mut inode, meta, S_IFREG, 0o644);
-        inode.i_size_lo = (data.len() & 0xFFFF_FFFF) as u32;
-        inode.i_size_high = (data.len() >> 32) as u32;
-        inode.i_links_count = 1;
-        inode.i_flags = EXT4_EXTENTS_FL;
-
-        let tree_meta_blocks = self.write_extent_tree(group, &mut inode, &leaf_extents)?;
-
-        // Total 512-byte sectors: data + tree metadata blocks
-        let mut total_sectors =
-            (blocks_needed as u64 + tree_meta_blocks as u64) * (BLOCK_SIZE as u64 / 512);
-
-        if !xattrs.is_empty() {
-            inode.i_file_acl_lo = self.write_prepared_xattr_block(group, &xattrs)?;
-            total_sectors += BLOCK_SIZE as u64 / 512;
-        }
-
-        inode.i_blocks_lo = total_sectors as u32;
-        let high_sectors = (total_sectors >> 32) as u16;
-        inode.i_osd2[0..2].copy_from_slice(&high_sectors.to_le_bytes());
-
-        self.groups[group].inode_table[index_in_group] = inode;
-        self.add_dir_entry(parent, name, ino, EXT4_FT_REG_FILE)?;
-
-        Ok(ino)
-    }
-
-    /// External, unshared xattr block. Its layout matches ext2fs' ext_attr format.
-    pub fn write_xattr_block(
-        &mut self,
-        group: usize,
-        xattrs: &HashMap<String, Vec<u8>>,
-    ) -> Result<u32> {
-        let xattrs = prepare_xattrs(xattrs)?;
-        self.write_prepared_xattr_block(group, &xattrs)
-    }
-
-    fn write_prepared_xattr_block(
-        &mut self,
-        group: usize,
-        xattrs: &[PreparedXattr],
-    ) -> Result<u32> {
-        let mut data = vec![0; BLOCK_SIZE];
-
-        let xattr_header = Ext4XattrHeader {
-            h_magic: EXT4_XATTR_MAGIC,
-            h_refcount: 1,
-            h_blocks: 1,
-            ..Default::default()
-        };
-        data[..32].copy_from_slice(xattr_header.as_bytes());
-
-        let (mut entry, mut value) = (32, BLOCK_SIZE);
-        let mut block_hash = 0u32;
-        for xattr in xattrs {
-            let aligned_contents_len = align4(xattr.value.len());
-            value = value
-                .checked_sub(aligned_contents_len)
-                .ok_or(anyhow::anyhow!("xattrs exceed one filesystem block"))?;
-            let entry_len = 16 + align4(xattr.suffix.len());
-            if entry + entry_len + 4 > value {
-                return Err(anyhow::anyhow!("xattrs exceed one filesystem block"));
-            }
-
-            let xattr_entry = Ext4XattrEntry {
-                e_name_len: xattr.suffix.len() as u8,
-                e_name_index: xattr.index,
-                e_value_offs: value as u16,
-                e_value_block: 0,
-                e_value_size: xattr.value.len() as u32,
-                e_hash: xattr_entry_hash(xattr.suffix.as_bytes(), &xattr.value),
-            };
-            data[entry..entry + 16].copy_from_slice(xattr_entry.as_bytes());
-
-            let entry_hash = xattr_entry_hash(xattr.suffix.as_bytes(), &xattr.value);
-            block_hash = block_hash.rotate_left(16) ^ entry_hash;
-            data[entry + 16..entry + 16 + xattr.suffix.len()]
-                .copy_from_slice(xattr.suffix.as_bytes());
-            data[value..value + xattr.value.len()].copy_from_slice(&xattr.value);
-            entry += entry_len;
-        }
-
-        // e2fsprogs uses this hash to identify an external attribute block.
-        // A nonzero hash is required even when we deliberately do not deduplicate blocks.
-        data[12..16].copy_from_slice(&block_hash.to_le_bytes());
-        // All serialization can fail before this allocation; after it, this
-        // function has no fallible path and cannot leak a reserved block.
-        let number = self.allocate_free_blocks(group, 1)?;
-        let offset = number as usize * BLOCK_SIZE;
-        self.disk_data[offset..offset + BLOCK_SIZE].copy_from_slice(&data);
-
-        Ok(number)
-    }
-
-    /// Create a symbolic link. Targets shorter than the inode's 60-byte
-    /// `i_block` field are stored inline; longer targets use one data block.
-    pub fn add_symlink(
-        &mut self,
-        parent: u32,
-        name: &str,
-        target: &str,
-        meta: &PosixMetadata,
-    ) -> Result<u32> {
-        Self::validate_name(name)?;
-        let expansion_blocks = self.dir_expansion_blocks_required(parent, name)?;
-
-        let target_bytes = target.as_bytes();
-        // Match ext2fs_symlink(): the terminating NUL must fit in one block,
-        // so an empty target and targets up to BLOCK_SIZE - 1 bytes are valid.
-        if target_bytes.len() >= BLOCK_SIZE {
-            return Err(anyhow::anyhow!(
-                "symlink target must be no longer than {} bytes",
-                BLOCK_SIZE - 1
-            ));
-        }
-
-        let xattrs = prepare_xattrs(&meta.xattrs)?;
-
-        // e2fsprogs defines fastlink as strictly less than i_block size (60 bytes)
-        let is_fastlink = target_bytes.len() < 60;
-        let block_needed = if is_fastlink { 0 } else { 1 };
-
-        // it finds the next free inode starting from the block of the parent directory, but still do not allocate it
-        let ino = self.next_free_inode(Some(parent))?;
-        // it gets the group of the free inode found
-        let (group, index_in_group) = self.inode_location(ino);
-        // it ensures that the group has enough capacity to allocate the new inode
-        self.ensure_allocation_capacity(
-            block_needed as u32 + expansion_blocks,
-            u32::from(!xattrs.is_empty()),
-        )?;
-
-        // allocate the inode
-        self.mark_inode_used(ino);
-
-        let mut inode = Ext4Inode::default();
-        Self::populate_inode_metadata(&mut inode, meta, S_IFLNK, 0o777);
-        inode.i_size_lo = target_bytes.len() as u32;
-        inode.i_links_count = 1;
-
-        if is_fastlink {
-            // Fast Symlink: Write directly into the 60-byte i_block array
-            inode.i_blocks_lo = 0;
-            inode.i_block[..target_bytes.len()].copy_from_slice(target_bytes);
-        } else {
-            // Note: e2fsprogs attempts inline_data here if the feature is enabled.
-            // Since this builder currently do not have inline_data support, we route
-            // directly to the slow block-allocated fallback.
-            let data_block = self.allocate_free_blocks(group, 1)?;
-            let offset = data_block as usize * BLOCK_SIZE;
-            // The e2fsprogs buffer is zero-initialized before copying the
-            // target, which supplies the NUL terminator and a zero-filled tail.
-            self.disk_data[offset..offset + BLOCK_SIZE].fill(0);
-            self.disk_data[offset..offset + target_bytes.len()].copy_from_slice(target_bytes);
-            inode.i_blocks_lo = (BLOCK_SIZE / 512) as u32;
-            inode.i_flags = EXT4_EXTENTS_FL;
-            init_single_extent(&mut inode, 1, data_block);
-        }
-
-        if !xattrs.is_empty() {
-            inode.i_file_acl_lo = self.write_prepared_xattr_block(group, &xattrs)?;
-            inode.i_blocks_lo += (BLOCK_SIZE / 512) as u32;
-        }
-
-        self.groups[group].inode_table[index_in_group] = inode;
-        self.add_dir_entry(parent, name, ino, EXT4_FT_SYMLINK)?;
-
-        Ok(ino)
-    }
-
-    // Create special inodes (devices, FIFOs, sockets)
-    // which do not occupy file extent blocks.
-    fn add_special_file(
-        &mut self,
-        parent: u32,
-        name: &str,
-        kind: u16,
-        default_perms: u16,
-        dir_file_type: u8,
-        i_block_payload: [u8; 60],
-        meta: &PosixMetadata,
-    ) -> Result<u32> {
-        Self::validate_name(name)?;
-        let expansion_blocks = self.dir_expansion_blocks_required(parent, name)?;
-
-        let xattrs = prepare_xattrs(&meta.xattrs)?;
-        // it finds the next free inode starting from the block of the parent directory, but still do not allocate it
-        let ino = self.next_free_inode(Some(parent))?;
-        // it gets the group of the free inode found
-        let (group, index_in_group) = self.inode_location(ino);
-        // it ensures that the group has enough capacity to allocate the new inode
-        self.ensure_allocation_capacity(expansion_blocks, u32::from(!xattrs.is_empty()))?;
-        // allocate the inode
-        self.mark_inode_used(ino);
-
-        let mut inode = Ext4Inode::default();
-        Self::populate_inode_metadata(&mut inode, meta, kind, default_perms);
-        inode.i_size_lo = 0;
-        inode.i_links_count = 1;
-        inode.i_blocks_lo = 0;
-        inode.i_flags = 0; // Special files do not use EXT4_EXTENTS_FL
-        inode.i_block = i_block_payload;
-
-        if !xattrs.is_empty() {
-            inode.i_file_acl_lo = self.write_prepared_xattr_block(group, &xattrs)?;
-            inode.i_blocks_lo += (BLOCK_SIZE / 512) as u32;
-        }
-
-        self.groups[group].inode_table[index_in_group] = inode;
-        self.add_dir_entry(parent, name, ino, dir_file_type)?;
-        Ok(ino)
-    }
-
-    /// Creates a character device node (e.g. /dev/null, /dev/console).
-    pub fn add_char_device(
-        &mut self,
-        parent: u32,
-        name: &str,
-        major: u32,
-        minor: u32,
-        meta: &PosixMetadata,
-    ) -> Result<u32> {
-        let payload = encode_device_number(major, minor)?;
-        self.add_special_file(parent, name, S_IFCHR, 0o660, EXT4_FT_CHRDEV, payload, meta)
-    }
-
-    /// Creates a block device node (e.g. /dev/sda, /dev/vda1).
-    pub fn add_block_device(
-        &mut self,
-        parent: u32,
-        name: &str,
-        major: u32,
-        minor: u32,
-        meta: &PosixMetadata,
-    ) -> Result<u32> {
-        let payload = encode_device_number(major, minor)?;
-        self.add_special_file(parent, name, S_IFBLK, 0o660, EXT4_FT_BLKDEV, payload, meta)
-    }
-
-    /// Creates a FIFO / named pipe.
-    pub fn add_fifo(&mut self, parent: u32, name: &str, meta: &PosixMetadata) -> Result<u32> {
-        self.add_special_file(parent, name, S_IFIFO, 0o644, EXT4_FT_FIFO, [0u8; 60], meta)
-    }
-
-    /// Creates a Unix domain socket.
-    pub fn add_socket(&mut self, parent: u32, name: &str, meta: &PosixMetadata) -> Result<u32> {
-        self.add_special_file(parent, name, S_IFSOCK, 0o777, EXT4_FT_SOCK, [0u8; 60], meta)
-    }
-
-    /// Recursively collects all leaf extents from an extent tree root or node block.
-    fn collect_leaf_extents(&self, block_data: &[u8], extents: &mut Vec<Ext4Extent>) -> Result<()> {
-        let header = Ext4ExtentHeader::read_from_bytes(&block_data[..12])
-            .map_err(|_| anyhow::anyhow!("invalid extent header"))?;
-        if header.eh_magic != EXT4_EH_MAGIC {
-            return Err(anyhow::anyhow!("invalid extent magic"));
-        }
-        let entries = header.eh_entries as usize;
-        if header.eh_depth == 0 {
-            for i in 0..entries {
-                let off = 12 + i * 12;
-                let ext = Ext4Extent::read_from_bytes(&block_data[off..off + 12])
-                    .map_err(|_| anyhow::anyhow!("invalid extent record"))?;
-                extents.push(ext);
-            }
-        } else {
-            for i in 0..entries {
-                let off = 12 + i * 12;
-                let idx = Ext4ExtentIdx::read_from_bytes(&block_data[off..off + 12])
-                    .map_err(|_| anyhow::anyhow!("invalid extent index"))?;
-                let blk = idx.ei_leaf_lo as usize;
-                let offset = blk * BLOCK_SIZE;
-                self.collect_leaf_extents(&self.disk_data[offset..offset + BLOCK_SIZE], extents)?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Collects the external extent-tree blocks reachable from a tree root.
-    fn collect_extent_tree_blocks(&self, block_data: &[u8], blocks: &mut Vec<u32>) -> Result<()> {
-        let header = Ext4ExtentHeader::read_from_bytes(&block_data[..12])
-            .map_err(|_| anyhow::anyhow!("invalid extent header"))?;
-        if header.eh_magic != EXT4_EH_MAGIC {
-            return Err(anyhow::anyhow!("invalid extent magic"));
-        }
-        if header.eh_depth == 0 {
-            return Ok(());
-        }
-        for i in 0..header.eh_entries as usize {
-            let off = 12 + i * 12;
-            let idx = Ext4ExtentIdx::read_from_bytes(&block_data[off..off + 12])
-                .map_err(|_| anyhow::anyhow!("invalid extent index"))?;
-            let block = idx.ei_leaf_lo;
-            blocks.push(block);
-            let data_offset = block as usize * BLOCK_SIZE;
-            self.collect_extent_tree_blocks(
-                &self.disk_data[data_offset..data_offset + BLOCK_SIZE],
-                blocks,
-            )?;
-        }
-        Ok(())
-    }
-
-    /// Reads all leaf extents associated with an inode.
-    pub(crate) fn get_inode_extents(&self, inode: &Ext4Inode) -> Result<Vec<Ext4Extent>> {
-        let mut extents = Vec::new();
-        self.collect_leaf_extents(&inode.i_block, &mut extents)?;
-        Ok(extents)
-    }
-
-    /// Returns the physical block numbers belonging to a directory in logical order.
-    pub(crate) fn get_dir_blocks(&self, ino: u32) -> Result<Vec<u32>> {
-        if !self.is_inode_allocated(ino) {
-            return Err(anyhow::anyhow!("inode {ino} does not exist"));
-        }
-        let (g, i) = self.inode_location(ino);
-        let inode = &self.groups[g].inode_table[i];
-        if inode.i_mode & S_IFDIR != S_IFDIR {
-            return Err(anyhow::anyhow!("inode {ino} is not a directory"));
-        }
-        if inode.i_flags & EXT4_EXTENTS_FL == 0 {
-            return Err(anyhow::anyhow!(
-                "directory inode {ino} does not use extents"
-            ));
-        }
-        let extents = self.get_inode_extents(inode)?;
-        let mut blocks = Vec::new();
-        for ext in extents {
-            for b in 0..ext.ee_len {
-                blocks.push(ext.ee_start_lo + b as u32);
-            }
-        }
-        Ok(blocks)
-    }
-
     /// Scans all directory blocks to verify `name` is unique, finding an available slot.
+    /// Finds reusable directory-entry space while rejecting duplicate names; returns a slot or `None` when full.
     fn find_dir_slot(&self, parent: u32, name: &str) -> Result<Option<DirSlot>> {
         Self::validate_name(name)?;
         let name_bytes = name.as_bytes();
@@ -701,7 +289,7 @@ impl Ext4ImageBuilder {
         Ok(found_slot)
     }
 
-    /// Allocates an additional block for a directory inode, matching `ext2fs_expand_dir`.
+    /// Adds one initialized data block to a directory; returns the new physical block number.
     pub(crate) fn expand_dir(&mut self, dir_ino: u32) -> Result<u32> {
         let (group, index_in_group) = self.inode_location(dir_ino);
         let inode = &self.groups[group].inode_table[index_in_group];
@@ -780,7 +368,7 @@ impl Ext4ImageBuilder {
         Ok(new_blk)
     }
 
-    /// Adds a directory entry to `parent`. Expands the directory automatically
+    /// Adds a directory entry to `parent`; returns `Ok(())` after expanding the directory when needed.
     /// when all existing blocks are full.
     pub fn add_dir_entry(
         &mut self,
@@ -838,9 +426,9 @@ impl Ext4ImageBuilder {
         Ok(())
     }
 
-    /// Returns all blocks that must be reserved to grow a full directory.
+    /// Calculates blocks required to add an entry, including possible growth metadata; returns that count.
     /// This includes a conservative full replacement extent-tree footprint.
-    fn dir_expansion_blocks_required(&self, parent: u32, name: &str) -> Result<u32> {
+    pub(crate) fn dir_expansion_blocks_required(&self, parent: u32, name: &str) -> Result<u32> {
         Self::validate_name(name)?;
         match self.find_dir_slot(parent, name)? {
             Some(_) => Ok(0),
@@ -855,154 +443,9 @@ impl Ext4ImageBuilder {
     }
 }
 
+/// Rounds a directory-record size up to four-byte alignment; returns the aligned size.
 fn align4(v: usize) -> usize {
     (v + 3) & !3
-}
-
-/// ext2fs' name/value rolling hashes (NAME_HASH_SHIFT=5, VALUE_HASH_SHIFT=16).
-fn xattr_entry_hash(name: &[u8], value: &[u8]) -> u32 {
-    let mut hash = 0u32;
-    for byte in name {
-        hash = hash.rotate_left(5) ^ u32::from(*byte);
-    }
-    for bytes in value.chunks(4) {
-        let mut word = [0u8; 4];
-        word[..bytes.len()].copy_from_slice(bytes);
-        hash = hash.rotate_left(16) ^ u32::from_le_bytes(word);
-    }
-    hash
-}
-
-/// Initializes a depth-0 inline extent header with a single contiguous extent.
-fn init_single_extent(inode: &mut Ext4Inode, blocks: u16, start: u32) {
-    let extent_header = Ext4ExtentHeader {
-        eh_magic: EXT4_EH_MAGIC,
-        eh_entries: u16::from(blocks != 0),
-        eh_max: 4,
-        eh_depth: 0,
-        eh_generation: 0,
-    };
-    inode.i_block[..12].copy_from_slice(extent_header.as_bytes());
-    if blocks != 0 {
-        let extent = Ext4Extent {
-            ee_block: 0,
-            ee_len: blocks,
-            ee_start_hi: 0,
-            ee_start_lo: start,
-        };
-        inode.i_block[12..24].copy_from_slice(extent.as_bytes());
-    }
-}
-
-pub fn parse_xattr_name(name: &str) -> Result<(u8, &str)> {
-    for (prefix, index) in [
-        ("system.posix_acl_access", EXT4_XATTR_INDEX_POSIX_ACL_ACCESS),
-        (
-            "system.posix_acl_default",
-            EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT,
-        ),
-        ("user.", EXT4_XATTR_INDEX_USER),
-        ("trusted.", EXT4_XATTR_INDEX_TRUSTED),
-        ("security.", EXT4_XATTR_INDEX_SECURITY),
-        ("system.", EXT4_XATTR_INDEX_SYSTEM),
-    ] {
-        if let Some(suffix) = name.strip_prefix(prefix) {
-            return Ok((index, suffix));
-        }
-    }
-    Err(anyhow::anyhow!(
-        "unsupported ext4 xattr namespace in {name:?}"
-    ))
-}
-
-fn prepare_xattrs(xattrs: &HashMap<String, Vec<u8>>) -> Result<Vec<PreparedXattr>> {
-    let mut prepared = Vec::with_capacity(xattrs.len());
-    for (name, value) in xattrs {
-        let (index, suffix) = parse_xattr_name(name)?;
-        // POSIX ACL attributes have no suffix. Other ext4 namespaces require one.
-        if suffix.len() > u8::MAX as usize
-            || (suffix.is_empty()
-                && !matches!(
-                    index,
-                    EXT4_XATTR_INDEX_POSIX_ACL_ACCESS | EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT
-                ))
-        {
-            return Err(anyhow::anyhow!("invalid xattr name {name:?}"));
-        }
-        let value = if matches!(
-            index,
-            EXT4_XATTR_INDEX_POSIX_ACL_ACCESS | EXT4_XATTR_INDEX_POSIX_ACL_DEFAULT
-        ) {
-            posix_acl_to_ext4_disk(value)?
-        } else {
-            value.clone()
-        };
-        prepared.push(PreparedXattr {
-            index,
-            suffix: suffix.to_owned(),
-            value,
-        });
-    }
-    prepared.sort_unstable_by(|left, right| {
-        (left.index, &left.suffix).cmp(&(right.index, &right.suffix))
-    });
-    Ok(prepared)
-}
-
-// Linux's getxattr ABI uses 8-byte entries; ext4 stores object/group/mask/
-// other entries in four bytes, exactly as e2fsprogs' convert_posix_acl_to_disk_buffer.
-fn posix_acl_to_ext4_disk(value: &[u8]) -> Result<Vec<u8>> {
-    const POSIX_ACL_XATTR_VERSION: u32 = 0x0002;
-    const EXT4_ACL_VERSION: u32 = 0x0001;
-    const ACL_USER_OBJ: u16 = 0x01;
-    const ACL_USER: u16 = 0x02;
-    const ACL_GROUP_OBJ: u16 = 0x04;
-    const ACL_GROUP: u16 = 0x08;
-    const ACL_MASK: u16 = 0x10;
-    const ACL_OTHER: u16 = 0x20;
-
-    if value.len() < 12
-        || (value.len() - 4) % 8 != 0
-        || u32::from_le_bytes(value[..4].try_into().unwrap()) != POSIX_ACL_XATTR_VERSION
-    {
-        return Err(anyhow::anyhow!("invalid POSIX ACL xattr payload"));
-    }
-    let mut disk = Vec::with_capacity(value.len());
-    disk.extend_from_slice(&EXT4_ACL_VERSION.to_le_bytes());
-    for entry in value[4..].chunks_exact(8) {
-        let tag = u16::from_le_bytes(entry[..2].try_into().unwrap());
-        let perm = u16::from_le_bytes(entry[2..4].try_into().unwrap());
-        if perm > 0o7 {
-            return Err(anyhow::anyhow!("POSIX ACL permissions exceed 0o7"));
-        }
-        disk.extend_from_slice(&tag.to_le_bytes());
-        disk.extend_from_slice(&perm.to_le_bytes());
-        match tag {
-            ACL_USER | ACL_GROUP => disk.extend_from_slice(&entry[4..8]),
-            ACL_USER_OBJ | ACL_GROUP_OBJ | ACL_MASK | ACL_OTHER => {}
-            _ => return Err(anyhow::anyhow!("unsupported POSIX ACL tag {tag:#x}")),
-        }
-    }
-    Ok(disk)
-}
-
-/// Encodes device major/minor numbers into the 60-byte `i_block` payload
-/// following Linux kernel / e2fsprogs encoding rules.
-fn encode_device_number(major: u32, minor: u32) -> Result<[u8; 60]> {
-    if major > 0x0fff || minor > 0x000f_ffff {
-        return Err(anyhow::anyhow!(
-            "device number ({major}, {minor}) exceeds Linux dev_t limits"
-        ));
-    }
-    let mut block = [0u8; 60];
-    if major < 256 && minor < 256 {
-        let old_dev = ((major << 8) | minor) as u32;
-        block[..4].copy_from_slice(&old_dev.to_le_bytes());
-    } else {
-        let new_dev = (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12);
-        block[4..8].copy_from_slice(&new_dev.to_le_bytes());
-    }
-    Ok(block)
 }
 
 #[cfg(test)]
@@ -1274,8 +717,8 @@ mod tests {
 
     #[test]
     fn device_numbers_must_fit_linux_dev_t() {
-        assert!(encode_device_number(0x1000, 0).is_err());
-        assert!(encode_device_number(0, 0x10_0000).is_err());
+        assert!(Ext4ImageBuilder::encode_device_number(0x1000, 0).is_err());
+        assert!(Ext4ImageBuilder::encode_device_number(0, 0x10_0000).is_err());
     }
 
     #[test]

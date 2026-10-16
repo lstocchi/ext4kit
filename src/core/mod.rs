@@ -5,6 +5,14 @@ use zerocopy::IntoBytes;
 
 use crate::ext4::*;
 
+mod allocation;
+pub mod directory;
+mod extent;
+mod file;
+mod special;
+mod symlink;
+pub use directory::PosixMetadata;
+
 // ============================================================================
 // Ext4 Image Writer Engine
 // ============================================================================
@@ -17,6 +25,7 @@ pub struct Ext4ImageBuilder {
 }
 
 impl Ext4ImageBuilder {
+    /// Creates an in-memory ext4 image builder of `size_mb`; returns initialized filesystem state.
     pub fn new(size_mb: usize) -> Self {
         if BYTES_PER_INODE_RATIO < BLOCK_SIZE {
             panic!("BYTES_PER_INODE_RATIO must be greater than or equal to BLOCK_SIZE");
@@ -109,6 +118,7 @@ impl Ext4ImageBuilder {
         builder
     }
 
+    /// Marks one physical block allocated and updates accounting; returns no value.
     fn mark_block_used(&mut self, group_idx: usize, block: u32) {
         let byte_idx = (block / 8) as usize;
         let bit_idx = block % 8;
@@ -119,6 +129,7 @@ impl Ext4ImageBuilder {
         self.superblock.s_free_blocks_count_lo -= 1;
     }
 
+    /// Marks one inode allocated and updates accounting; returns no value.
     pub(crate) fn mark_inode_used(&mut self, inode: u32) {
         let (group, index_in_group) = self.inode_location(inode);
         let byte_idx = (index_in_group / 8) as usize;
@@ -130,6 +141,7 @@ impl Ext4ImageBuilder {
         self.superblock.s_free_inodes_count -= 1;
     }
 
+    /// Returns whether a block group contains a sparse-super backup.
     fn group_has_super(group_idx: usize) -> bool {
         if group_idx == 0 || group_idx == 1 {
             return true;
@@ -145,6 +157,7 @@ impl Ext4ImageBuilder {
         })
     }
 
+    /// Initializes per-group metadata placement and allocation maps; returns no value.
     fn init_layout(&mut self) {
         let block_groups_number = self.groups.len();
 
@@ -211,6 +224,7 @@ impl Ext4ImageBuilder {
         }
     }
 
+    /// Serializes a group's superblock and descriptor table into the image; returns no value.
     fn write_superblock_and_gdt(&mut self, group_idx: usize) {
         let group_start = group_idx * BLOCKS_PER_GROUP * BLOCK_SIZE;
         let mut superblock = self.superblock;
@@ -229,6 +243,7 @@ impl Ext4ImageBuilder {
         }
     }
 
+    /// Serializes all in-memory inode tables into the image buffer; returns no value.
     fn write_inode_table(&mut self) {
         for group_idx in 0..self.groups.len() {
             // Set the INODE_ZEROED flag on the group descriptor so Linux knows
@@ -248,6 +263,7 @@ impl Ext4ImageBuilder {
 
     /// Reserve a contiguous extent, preferring the inode's block group and
     /// wrapping to later groups when necessary.
+    /// Allocates contiguous free blocks in a preferred group; returns the first physical block number.
     pub(crate) fn allocate_free_blocks(
         &mut self,
         preferred_group: usize,
@@ -289,6 +305,7 @@ impl Ext4ImageBuilder {
     }
 
     /// Releases one previously allocated absolute block.
+    /// Releases one allocated physical block and updates accounting; returns `Ok(())` or an error.
     pub(crate) fn release_block(&mut self, block: u32) -> Result<()> {
         let group = (block as usize) / BLOCKS_PER_GROUP;
         let local = (block as usize) % BLOCKS_PER_GROUP;
@@ -309,6 +326,7 @@ impl Ext4ImageBuilder {
 
     /// Prove that a file extent plus any separately allocated metadata block
     /// can be allocated before changing the block bitmap.
+    /// Verifies enough data and metadata blocks remain; returns `Ok(())` or an exhaustion error.
     pub(crate) fn ensure_allocation_capacity(
         &self,
         extent_blocks: u32,
@@ -328,6 +346,7 @@ impl Ext4ImageBuilder {
         Ok(())
     }
 
+    /// Initializes the ext4 root directory inode and entries; returns `Ok(())` or an allocation error.
     pub fn create_root_dir(&mut self) -> Result<()> {
         let root_data_block = self.allocate_free_blocks(0, 1)?;
 
@@ -399,6 +418,7 @@ impl Ext4ImageBuilder {
         Ok(())
     }
 
+    /// Creates and links the conventional `lost+found` directory; returns `Ok(())` or an error.
     pub fn create_lost_and_found(&mut self) -> Result<()> {
         let lpf_inode_num = EXT4_FIRST_INO;
 
@@ -494,6 +514,7 @@ impl Ext4ImageBuilder {
         Ok(())
     }
 
+    /// Reserves ext4's fixed low-numbered inodes; returns no value.
     pub fn reserve_inodes(&mut self) {
         self.mark_inode_used(EXT4_BAD_INO);
 
@@ -504,6 +525,7 @@ impl Ext4ImageBuilder {
     }
 
     /// Flushes Superblock and Group Descriptors into disk_data, then writes to file
+    /// Finalizes metadata and writes the image to `output_path`; returns I/O success or failure.
     pub fn write_to_file(&mut self, output_path: &str) -> std::io::Result<()> {
         // Commit Inode Tables
         self.write_inode_table();
@@ -530,6 +552,7 @@ impl Ext4ImageBuilder {
     }
 
     /// Calculate maximum metadata blocks required for an extent tree.
+    /// Calculates the maximum external extent-tree blocks for leaf extent count; returns that count.
     pub fn max_extent_tree_blocks(num_extents: usize) -> usize {
         if num_extents <= EXT4_EXTENTS_IN_INODE {
             return 0;
@@ -552,6 +575,7 @@ impl Ext4ImageBuilder {
 
     /// Serializes an extent tree into the inode and external blocks.
     /// Returns the number of external tree metadata blocks allocated.
+    /// Serializes an inode's extent tree; returns the number of external tree blocks allocated.
     pub(crate) fn write_extent_tree(
         &mut self,
         preferred_group: usize,

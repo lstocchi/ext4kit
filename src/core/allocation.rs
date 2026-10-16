@@ -1,7 +1,8 @@
-use crate::builder::Ext4ImageBuilder;
+use super::Ext4ImageBuilder;
 use anyhow::Result;
 
 impl Ext4ImageBuilder {
+    /// Maps an inode number to its block-group and zero-based table index; returns both indices.
     pub fn inode_location(&self, ino: u32) -> (usize, usize) {
         let inodes_per_group = self.superblock.s_inodes_per_group;
         (
@@ -10,6 +11,7 @@ impl Ext4ImageBuilder {
         )
     }
 
+    /// Returns whether `ino` is valid and marked allocated in its inode bitmap.
     pub fn is_inode_allocated(&self, ino: u32) -> bool {
         if ino == 0 || ino > self.superblock.s_inodes_count {
             return false;
@@ -21,6 +23,7 @@ impl Ext4ImageBuilder {
         self.groups[group as usize].inode_bitmap[byte_idx] & (1 << bit_idx) != 0
     }
 
+    /// Finds the next free inode, preferring the parent's block group; returns its inode number.
     pub(crate) fn next_free_inode(&self, parent_dir_ino: Option<u32>) -> Result<u32> {
         let total_inodes = self.superblock.s_inodes_count;
         let inodes_per_group = self.superblock.s_inodes_per_group;

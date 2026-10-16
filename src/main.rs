@@ -1,5 +1,9 @@
-use ext4kit::{builder::Ext4ImageBuilder, directory::PosixMetadata, ext4};
+use ext4kit::{
+    core::{Ext4ImageBuilder, PosixMetadata},
+    ext4,
+};
 
+/// This is used just to build the demonstration ext4 image
 fn main() -> anyhow::Result<()> {
     const IMAGE_SIZE_MB: usize = 400;
     let output_file = std::env::args()
