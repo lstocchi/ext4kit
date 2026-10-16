@@ -1,10 +1,4 @@
-mod allocation;
-mod builder;
-mod directory;
-mod ext4;
-
-use builder::Ext4ImageBuilder;
-use directory::PosixMetadata;
+use ext4kit::{builder::Ext4ImageBuilder, directory::PosixMetadata, ext4};
 
 fn main() -> anyhow::Result<()> {
     const IMAGE_SIZE_MB: usize = 400;
@@ -24,9 +18,9 @@ fn main() -> anyhow::Result<()> {
     };
     sample_metadata
         .xattrs
-        .insert("user.creator".to_owned(), b"ext4win".to_vec());
+        .insert("user.creator".to_owned(), b"ext4kit".to_vec());
     let dir = builder.mkdir(ext4::EXT4_ROOT_INO, "test_dir", None)?;
-    builder.add_file(dir, "hello.txt", b"Created by ext4win\n", &sample_metadata)?;
+    builder.add_file(dir, "hello.txt", b"Created by ext4kit\n", &sample_metadata)?;
 
     builder.write_to_file(&output_file)?;
 

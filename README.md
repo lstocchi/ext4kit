@@ -1,6 +1,6 @@
-# ext4win
+# ext4kit
 
-`ext4win` is a Windows-native Rust tool for creating ext4 filesystem images
+`ext4kit` is a Windows-native Rust toolkit for creating ext4 filesystem images
 without requiring Linux, WSL, or `mke2fs` at image-creation time.
 
 Its purpose is to make application files available to a Linux VM through a
@@ -22,8 +22,8 @@ The intended end-to-end workflows are:
 For example, the eventual CLI should support a workflow conceptually like:
 
 ```text
-ext4win from-oci ghcr.io/example/service:latest service.ext4
-ext4win inject C:\work\my-app app-data.ext4 --destination /opt/my-app
+ext4kit from-oci ghcr.io/example/service:latest service.ext4
+ext4kit inject C:\work\my-app app-data.ext4 --destination /opt/my-app
 ```
 
 The generated image can then be attached as a virtual disk and mounted by the
@@ -68,8 +68,8 @@ The demonstration image currently contains:
     └── hello.txt
 ```
 
-`hello.txt` contains `Created by ext4win` and has the xattr
-`user.creator=ext4win`.
+`hello.txt` contains `Created by ext4kit` and has the xattr
+`user.creator=ext4kit`.
 
 The current prototype does **not yet** import OCI layers, traverse host
 directories, or expose the planned `from-oci` / `inject` commands. It is the
