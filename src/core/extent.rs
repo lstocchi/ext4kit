@@ -72,6 +72,9 @@ impl Ext4ImageBuilder {
 
     /// Returns a directory's physical data blocks in logical order, or an error if it is invalid.
     pub(crate) fn get_dir_blocks(&self, ino: u32) -> Result<Vec<u32>> {
+        if ino == 0 {
+            return Err(anyhow::anyhow!("inode 0 does not exist"));
+        }
         if !self.is_inode_allocated(ino) {
             return Err(anyhow::anyhow!("inode {ino} does not exist"));
         }

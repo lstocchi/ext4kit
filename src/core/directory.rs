@@ -28,7 +28,7 @@ pub(crate) struct PreparedXattr {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum DirSlot {
+pub(crate) enum DirSlot {
     /// An active directory entry with slack space that can be split.
     Split {
         offset: usize,
@@ -229,10 +229,13 @@ impl Ext4ImageBuilder {
         }
     }
 
-    /// Scans all directory blocks to verify `name` is unique, finding an available slot.
+    /// Scans a directory leaf to verify `name` is unique, finding an available slot.
     /// Finds reusable directory-entry space while rejecting duplicate names; returns a slot or `None` when full.
     fn find_dir_slot(&self, parent: u32, name: &str) -> Result<Option<DirSlot>> {
         Self::validate_name(name)?;
+        if self.dir_is_indexed(parent)? {
+            return self.find_htree_slot(parent, name);
+        }
         let name_bytes = name.as_bytes();
         let needed = align4(8 + name_bytes.len());
         let blocks = self.get_dir_blocks(parent)?;
@@ -381,10 +384,10 @@ impl Ext4ImageBuilder {
         let slot = match self.find_dir_slot(parent, name)? {
             Some(slot) => slot,
             None => {
-                self.expand_dir(parent)?;
-                self.find_dir_slot(parent, name)?.ok_or_else(|| {
-                    anyhow::anyhow!("failed to find slot after directory expansion")
-                })?
+                if !self.dir_is_indexed(parent)? {
+                    return self.make_indexed_and_insert(parent, name, child, file_type);
+                }
+                return self.split_htree_leaf_and_insert(parent, name, child, file_type);
             }
         };
 
@@ -435,8 +438,15 @@ impl Ext4ImageBuilder {
             None => {
                 let (group, index) = self.inode_location(parent);
                 let extents = self.get_inode_extents(&self.groups[group].inode_table[index])?;
-                let tree_blocks = Self::max_extent_tree_blocks(extents.len() + 1) as u32;
-                1u32.checked_add(tree_blocks)
+                let data_blocks: u32 = if self.dir_is_indexed(parent)? {
+                    self.htree_growth_blocks(parent, name)?
+                } else {
+                    2
+                };
+                let tree_blocks =
+                    Self::max_extent_tree_blocks(extents.len() + data_blocks as usize) as u32;
+                data_blocks
+                    .checked_add(tree_blocks)
                     .ok_or_else(|| anyhow::anyhow!("directory expansion allocation overflow"))
             }
         }
@@ -444,7 +454,7 @@ impl Ext4ImageBuilder {
 }
 
 /// Rounds a directory-record size up to four-byte alignment; returns the aligned size.
-fn align4(v: usize) -> usize {
+pub(crate) fn align4(v: usize) -> usize {
     (v + 3) & !3
 }
 
@@ -815,9 +825,15 @@ mod tests {
 
         let dir_inode = &builder.groups[g].inode_table[i];
         let size_lo = u32::from_le_bytes(dir_inode.i_size_lo.to_le_bytes());
-        assert_eq!(size_lo, (2 * BLOCK_SIZE) as u32);
+        // A full linear block is converted into one dx root and two hashed
+        // leaves, following e2fsprogs' initial htree split layout.
+        assert_eq!(size_lo, (3 * BLOCK_SIZE) as u32);
         let blocks_lo = u32::from_le_bytes(dir_inode.i_blocks_lo.to_le_bytes());
-        assert_eq!(blocks_lo, 16);
+        assert_eq!(blocks_lo, 24);
+        assert_ne!(dir_inode.i_flags & EXT4_INDEX_FL, 0);
+        let entries = builder.read_dx_entries(test_dir).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], (0, 1));
 
         // Duplicate detection must work across both block 0 and block 1
         assert!(
@@ -854,16 +870,24 @@ mod tests {
         let (group, index) = builder.inode_location(directory);
         let inode = &builder.groups[group].inode_table[index];
         let inode_size = inode.i_size_lo;
-        assert_eq!(inode_size, 6 * BLOCK_SIZE as u32);
-        // Six directory data blocks plus exactly one live extent-tree block.
+        assert_eq!(inode_size as usize % BLOCK_SIZE, 0);
+        assert_ne!(inode.i_flags & EXT4_INDEX_FL, 0);
+        let data_blocks = inode_size as usize / BLOCK_SIZE;
+        assert!(data_blocks >= 3);
+        // Directory data blocks plus the live extent-tree metadata block.
         let inode_blocks = inode.i_blocks_lo;
-        assert_eq!(inode_blocks, 7 * (BLOCK_SIZE / 512) as u32);
-        assert_eq!(builder.get_inode_extents(inode).unwrap().len(), 6);
-        // Every file uses one data block; growth uses five more directory
-        // blocks and one extent-tree block, with no replaced-tree leaks.
+        let tree_blocks = Ext4ImageBuilder::max_extent_tree_blocks(
+            builder.get_inode_extents(inode).unwrap().len(),
+        );
+        assert_eq!(
+            inode_blocks,
+            ((data_blocks + tree_blocks) * (BLOCK_SIZE / 512)) as u32
+        );
+        // Every file uses one data block; directory data and its live extent
+        // metadata account for the rest (no replacement-tree leaks).
         assert_eq!(
             free_before - builder.superblock.s_free_blocks_count_lo,
-            entry_count as u32 + 6
+            entry_count as u32 + (data_blocks - 1) as u32 + tree_blocks as u32
         );
     }
 
@@ -889,7 +913,7 @@ mod tests {
         // Model an almost-full filesystem: insufficient for the child data,
         // directory block, and tree metadata. The failure must occur before
         // the child inode or either directory allocation is committed.
-        builder.superblock.s_free_blocks_count_lo = 2;
+        builder.superblock.s_free_blocks_count_lo = 0;
         assert!(
             builder
                 .add_file(directory, "requires_tree", b"content", &meta)
@@ -898,8 +922,90 @@ mod tests {
         let free_inodes_after = builder.superblock.s_free_inodes_count;
         let free_blocks_after = builder.superblock.s_free_blocks_count_lo;
         assert_eq!(free_inodes_after, free_inodes_before);
-        assert_eq!(free_blocks_after, 2);
+        assert_eq!(free_blocks_after, 0);
         let size_after = builder.groups[group].inode_table[index].i_size_lo;
         assert_eq!(size_after, size_before);
+    }
+
+    #[test]
+    fn htree_lookup_follows_collision_continuation_leaf() {
+        let mut builder = fresh_builder().unwrap();
+        let directory = builder.mkdir(EXT4_ROOT_INO, "collisions", None).unwrap();
+        let meta = PosixMetadata::default();
+        for file_idx in 0..220 {
+            builder
+                .add_file(directory, &format!("file_{file_idx:07}"), b"", &meta)
+                .unwrap();
+        }
+
+        let blocks = builder.get_dir_blocks(directory).unwrap();
+        let name = "collision-target";
+        let hash = builder.dir_hash(name.as_bytes());
+        builder
+            .write_dir_leaf(
+                blocks[1],
+                &[super::super::htree::HtreeEntry {
+                    hash: 0,
+                    inode: 100,
+                    file_type: EXT4_FT_REG_FILE,
+                    name: b"other".to_vec(),
+                }],
+            )
+            .unwrap();
+        builder
+            .write_dir_leaf(
+                blocks[2],
+                &[super::super::htree::HtreeEntry {
+                    hash,
+                    inode: 101,
+                    file_type: EXT4_FT_REG_FILE,
+                    name: name.as_bytes().to_vec(),
+                }],
+            )
+            .unwrap();
+        builder
+            .write_dx_root(directory, EXT4_ROOT_INO, 0, &[(0, 1), (hash | 1, 2)])
+            .unwrap();
+
+        assert!(builder.find_htree_slot(directory, name).is_err());
+    }
+
+    #[test]
+    fn full_dx_root_is_promoted_to_indirect_node() {
+        let mut builder = fresh_builder().unwrap();
+        let directory = builder.mkdir(EXT4_ROOT_INO, "promotion", None).unwrap();
+        let meta = PosixMetadata::default();
+        for file_idx in 0..220 {
+            builder
+                .add_file(directory, &format!("file_{file_idx:07}"), b"", &meta)
+                .unwrap();
+        }
+
+        let blocks = builder.get_dir_blocks(directory).unwrap();
+        let full_leaf: Vec<_> = (0..204)
+            .map(|i| {
+                let name = format!("e{i:011}").into_bytes();
+                super::super::htree::HtreeEntry {
+                    hash: builder.dir_hash(&name),
+                    inode: 100 + i,
+                    file_type: EXT4_FT_REG_FILE,
+                    name,
+                }
+            })
+            .collect();
+        builder.write_dir_leaf(blocks[1], &full_leaf).unwrap();
+        let root_entries = vec![(0, 1); (BLOCK_SIZE - 32) / 8];
+        builder
+            .write_dx_root(directory, EXT4_ROOT_INO, 0, &root_entries)
+            .unwrap();
+
+        builder
+            .split_htree_leaf_and_insert(directory, "new_entry", 999, EXT4_FT_REG_FILE)
+            .unwrap();
+
+        let root_block = builder.get_dir_blocks(directory).unwrap()[0] as usize * BLOCK_SIZE;
+        assert_eq!(builder.disk_data[root_block + 30], 1);
+        let root = builder.read_dx_entries(directory).unwrap();
+        assert_eq!(root, vec![(0, 4)]);
     }
 }

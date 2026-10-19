@@ -7,8 +7,10 @@ use crate::ext4::*;
 
 mod allocation;
 pub mod directory;
+pub mod dirhash;
 mod extent;
 mod file;
+mod htree;
 mod special;
 mod symlink;
 pub use directory::PosixMetadata;
@@ -53,6 +55,13 @@ impl Ext4ImageBuilder {
         let total_inodes = inodes_per_group * block_groups_number;
 
         let mut superblock = Ext4SuperBlock::default();
+        // Directory-index hashes must be seeded with a random value each run
+        let mut hash_seed_bytes = [0u8; 16];
+        getrandom::fill(&mut hash_seed_bytes)
+            .expect("the operating system must provide random bytes for the ext4 hash seed");
+        superblock.s_hash_seed = std::array::from_fn(|word| {
+            u32::from_le_bytes(hash_seed_bytes[word * 4..word * 4 + 4].try_into().unwrap())
+        });
         superblock.s_inodes_count = total_inodes as u32;
         superblock.s_blocks_count_lo = blocks_number as u32;
         superblock.s_free_blocks_count_lo = blocks_number as u32; // Adjusted in init_layout

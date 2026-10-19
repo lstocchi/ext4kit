@@ -1,3 +1,4 @@
+use crate::core::dirhash;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 // ============================================================================
@@ -51,13 +52,13 @@ pub const S_IFLNK: u16 = 0xA000; // Symbolic link
 pub const S_IFSOCK: u16 = 0xC000; // Socket
 
 // Feature Flags
-// These are separate flags: INODE_UNINIT is 0x0001, while INODE_ZEROED is
-// used for an initialized (and zero-filled) inode table.
 pub const EXT4_BG_INODE_ZEROED: u16 = 0x0004;
 pub const EXT4_FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
 pub const EXT4_FEATURE_INCOMPAT_EXTENTS: u32 = 0x0040;
 pub const EXT4_FEATURE_COMPAT_EXT_ATTR: u32 = 0x0008;
 pub const EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
+pub const EXT4_FEATURE_COMPAT_DIR_INDEX: u32 = 0x0020;
+pub const EXT4_INDEX_FL: u32 = 0x0000_1000;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, Immutable, IntoBytes, KnownLayout)]
@@ -98,7 +99,20 @@ pub struct Ext4SuperBlock {
     pub s_volume_name: [u8; 16],
     pub s_last_mounted: [u8; 64],
     pub s_algorithm_usage_bitmap: u32,
-    pub _padding: [u8; 820],
+    // Keep these intervening revision-one fields so the dx hash seed and
+    // version land at the ext4-specified offsets (236 and 252).
+    pub _s_prealloc_blocks: u8,
+    pub _s_prealloc_dir_blocks: u8,
+    pub _s_reserved_gdt_blocks: u16,
+    pub _s_journal_uuid: [u8; 16],
+    pub _s_journal_inum: u32,
+    pub _s_journal_dev: u32,
+    pub _s_last_orphan: u32,
+    pub s_hash_seed: [u32; 4], // 16-byte htree hash seed
+    pub s_def_hash_version: u8,
+    pub _s_jnl_backup_type: u8,
+    pub _s_desc_size: u16,
+    pub _padding: [u8; 768],
 }
 
 impl Default for Ext4SuperBlock {
@@ -133,7 +147,7 @@ impl Default for Ext4SuperBlock {
             s_inode_size: 256, // Standard ext4 inode size
             s_block_group_nr: 0,
             // External xattr blocks are referenced through i_file_acl_lo.
-            s_feature_compat: EXT4_FEATURE_COMPAT_EXT_ATTR,
+            s_feature_compat: EXT4_FEATURE_COMPAT_EXT_ATTR | EXT4_FEATURE_COMPAT_DIR_INDEX,
             s_feature_incompat: EXT4_FEATURE_INCOMPAT_FILETYPE | EXT4_FEATURE_INCOMPAT_EXTENTS,
             // The allocator below places backups only in sparse-super groups.
             s_feature_ro_compat: EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER,
@@ -141,7 +155,18 @@ impl Default for Ext4SuperBlock {
             s_volume_name: [0; 16],
             s_last_mounted: [0; 64],
             s_algorithm_usage_bitmap: 0,
-            _padding: [0; 820],
+            _s_prealloc_blocks: 0,
+            _s_prealloc_dir_blocks: 0,
+            _s_reserved_gdt_blocks: 0,
+            _s_journal_uuid: [0; 16],
+            _s_journal_inum: 0,
+            _s_journal_dev: 0,
+            _s_last_orphan: 0,
+            s_hash_seed: [0x8a1f_3b4c, 0x5e92_10d8, 0x4f7c_2b90, 0x61e3_8a5d],
+            s_def_hash_version: dirhash::DX_HASH_HALF_MD4,
+            _s_jnl_backup_type: 0,
+            _s_desc_size: 0,
+            _padding: [0; 768],
         }
     }
 }
@@ -274,4 +299,28 @@ pub struct Ext4BlockGroup {
     pub inode_table: Vec<Ext4Inode>,
     pub free_blocks_count: u16,
     pub free_inodes_count: u16,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, Immutable, IntoBytes, KnownLayout)]
+pub struct Ext4DxRootInfo {
+    pub reserved_zero: u32,
+    pub hash_version: u8,
+    pub info_length: u8,
+    pub indirect_levels: u8,
+    pub unused_flags: u8,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, Immutable, IntoBytes, KnownLayout)]
+pub struct Ext4DxCountlimit {
+    pub limit: u16,
+    pub count: u16,
+}
+
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, Immutable, IntoBytes, KnownLayout)]
+pub struct Ext4DxEntry {
+    pub hash: u32,
+    pub block: u32, // Logical block index inside directory
 }

@@ -5,4 +5,5 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
+getrandom = "0.3"
 zerocopy = { version = "0.8.59", features = ["derive"] }
