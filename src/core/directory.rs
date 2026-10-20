@@ -110,7 +110,13 @@ impl Ext4ImageBuilder {
         // allocate the inode
         self.mark_inode_used(ino);
 
-        let data_block = self.allocate_free_blocks(group, 1)?;
+        let data_block = match self.allocate_free_blocks(group, 1) {
+            Ok(block) => block,
+            Err(error) => {
+                self.release_inode(ino)?;
+                return Err(error);
+            }
+        };
         let mut block = vec![0; BLOCK_SIZE];
 
         let dot_header = Ext4DirEntry2Header {
@@ -145,14 +151,29 @@ impl Ext4ImageBuilder {
         Self::populate_inode_metadata(&mut inode, meta, S_IFDIR, 0o755);
         Self::init_single_extent(&mut inode, 1, data_block);
         if !xattrs.is_empty() {
-            inode.i_file_acl_lo = self.write_prepared_xattr_block(group, &xattrs)?;
+            inode.i_file_acl_lo = match self.write_prepared_xattr_block(group, &xattrs) {
+                Ok(block) => block,
+                Err(error) => {
+                    self.release_block(data_block)?;
+                    self.release_inode(ino)?;
+                    return Err(error);
+                }
+            };
             inode.i_blocks_lo += (BLOCK_SIZE / 512) as u32;
         }
 
         self.groups[group].inode_table[index_in_group] = inode;
         self.group_descriptors[group].bg_used_dirs_count_lo += 1;
         // add the new directory entry to the parent
-        self.add_dir_entry(parent, name, ino, EXT4_FT_DIR)?;
+        if let Err(error) = self.add_dir_entry(parent, name, ino, EXT4_FT_DIR) {
+            if inode.i_file_acl_lo != 0 {
+                self.release_block(inode.i_file_acl_lo)?;
+            }
+            self.release_block(data_block)?;
+            self.release_inode(ino)?;
+            self.group_descriptors[group].bg_used_dirs_count_lo -= 1;
+            return Err(error);
+        }
         let (pgroup, pindex_in_group) = self.inode_location(parent);
         self.groups[pgroup].inode_table[pindex_in_group].i_links_count += 1;
         Ok(ino)

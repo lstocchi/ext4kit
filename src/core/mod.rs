@@ -229,6 +229,25 @@ impl Ext4ImageBuilder {
             self.next_inode_hints[group].max(index_in_group as usize + 1);
     }
 
+    /// Releases an allocated inode and restores its allocation accounting.
+    /// The caller is responsible for releasing any blocks owned by the inode.
+    pub(crate) fn release_inode(&mut self, inode: u32) -> Result<()> {
+        if !self.is_inode_allocated(inode) {
+            return Err(anyhow::anyhow!("inode {inode} is not allocated"));
+        }
+        let (group, index_in_group) = self.inode_location(inode);
+        let byte_idx = index_in_group / 8;
+        let bit_idx = index_in_group % 8;
+
+        self.groups[group].inode_bitmap[byte_idx] &= !(1 << bit_idx);
+        self.groups[group].free_inodes_count += 1;
+        self.group_descriptors[group].bg_free_inodes_count_lo += 1;
+        self.superblock.s_free_inodes_count += 1;
+        self.next_inode_hints[group] = self.next_inode_hints[group].min(index_in_group);
+        self.groups[group].inode_table[index_in_group] = Ext4Inode::default();
+        Ok(())
+    }
+
     /// Returns whether a block group contains a sparse-super backup.
     fn group_has_super(group_idx: usize) -> bool {
         if group_idx == 0 || group_idx == 1 {
