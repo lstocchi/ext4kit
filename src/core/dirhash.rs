@@ -108,6 +108,28 @@ fn str2hashbuf(msg: &[u8], len: usize, buf: &mut [u32; 8], mut num: usize) {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::str2hashbuf;
+
+    #[test]
+    fn str2hashbuf_pads_partial_words_like_e2fsprogs() {
+        let mut buf = [0; 8];
+        str2hashbuf(&[1, 2, 3], 3, &mut buf, 8);
+
+        assert_eq!(buf[0], 0x0301_0203);
+        assert!(buf[1..].iter().all(|&word| word == 0x0303_0303));
+    }
+
+    #[test]
+    fn str2hashbuf_sign_extends_non_ascii_bytes() {
+        let mut buf = [0; 8];
+        str2hashbuf(&[0x80], 1, &mut buf, 8);
+
+        assert_eq!(buf[0], 0x0101_0080);
+    }
+}
+
 pub fn ext4_dirhash_half_md4(name: &[u8], seed: Option<&[u32; 4]>) -> (u32, u32) {
     let mut buf = [0x67452301u32, 0xefcdab89u32, 0x98badcfeu32, 0x10325476u32];
 
