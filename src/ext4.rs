@@ -11,8 +11,14 @@ pub const INODE_SIZE: usize = 256;
 pub const BYTES_PER_INODE_RATIO: usize = 4096;
 pub const BLOCKS_PER_GROUP: usize = 32768;
 pub const EXT4_EXTENTS_IN_INODE: usize = 4;
+/// Size reserved by `ext4_extent_tail` when extent-tree metadata checksums are
+/// enabled. At a 4 KiB block size it occupies the four bytes left after 340
+/// entries, so it does not alter the capacity constants below.
+pub const EXT4_EXTENT_TAIL_SIZE: usize = 4;
+/// Capacity of an external extent leaf block, with or without its checksum tail.
 pub const EXT4_EXTENTS_PER_BLOCK: usize =
     (BLOCK_SIZE - std::mem::size_of::<Ext4ExtentHeader>()) / std::mem::size_of::<Ext4Extent>(); // 340
+/// Capacity of an external extent index block, with or without its checksum tail.
 pub const EXT4_INDEXES_PER_BLOCK: usize =
     (BLOCK_SIZE - std::mem::size_of::<Ext4ExtentHeader>()) / std::mem::size_of::<Ext4ExtentIdx>(); // 340
 
@@ -57,6 +63,10 @@ pub const EXT4_FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
 pub const EXT4_FEATURE_INCOMPAT_EXTENTS: u32 = 0x0040;
 pub const EXT4_FEATURE_COMPAT_EXT_ATTR: u32 = 0x0008;
 pub const EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
+/// Metadata checksum features are intentionally unsupported: corresponding
+/// superblock feature flags stay clear and checksum fields remain zero.
+pub const EXT4_FEATURE_RO_COMPAT_GDT_CSUM: u32 = 0x0010;
+pub const EXT4_FEATURE_RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
 pub const EXT4_FEATURE_COMPAT_DIR_INDEX: u32 = 0x0020;
 pub const EXT4_INDEX_FL: u32 = 0x0000_1000;
 
@@ -150,6 +160,8 @@ impl Default for Ext4SuperBlock {
             s_feature_compat: EXT4_FEATURE_COMPAT_EXT_ATTR | EXT4_FEATURE_COMPAT_DIR_INDEX,
             s_feature_incompat: EXT4_FEATURE_INCOMPAT_FILETYPE | EXT4_FEATURE_INCOMPAT_EXTENTS,
             // The allocator below places backups only in sparse-super groups.
+            // Keep GDT_CSUM and METADATA_CSUM clear: this writer does not
+            // calculate group-descriptor, bitmap, or extent-block checksums.
             s_feature_ro_compat: EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER,
             s_uuid: [0; 16],
             s_volume_name: [0; 16],
@@ -225,7 +237,75 @@ pub struct Ext4Inode {
 
 impl Default for Ext4Inode {
     fn default() -> Self {
-        unsafe { std::mem::zeroed() }
+        Self {
+            i_mode: 0,
+            i_uid: 0,
+            i_size_lo: 0,
+            i_atime: 0,
+            i_ctime: 0,
+            i_mtime: 0,
+            i_dtime: 0,
+            i_gid: 0,
+            i_links_count: 0,
+            i_blocks_lo: 0,
+            i_flags: 0,
+            i_osd1: 0,
+            i_block: [0; 60],
+            i_generation: 0,
+            i_file_acl_lo: 0,
+            i_size_high: 0,
+            i_obso_faddr: 0,
+            i_osd2: [0; 12],
+            i_extra_isize: 0,
+            i_checksum_hi: 0,
+            i_ctime_extra: 0,
+            i_mtime_extra: 0,
+            i_atime_extra: 0,
+            i_crtime: 0,
+            i_crtime_extra: 0,
+            i_version_hi: 0,
+            i_projid: 0,
+            _padding: [0; 96],
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inode_default_is_a_zeroed_on_disk_inode() {
+        assert!(
+            Ext4Inode::default()
+                .as_bytes()
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+    }
+
+    #[test]
+    fn checksum_features_are_not_advertised_without_checksum_support() {
+        let features = Ext4SuperBlock::default().s_feature_ro_compat;
+        assert_eq!(features & EXT4_FEATURE_RO_COMPAT_GDT_CSUM, 0);
+        assert_eq!(features & EXT4_FEATURE_RO_COMPAT_METADATA_CSUM, 0);
+    }
+
+    #[test]
+    fn extent_capacities_leave_exactly_room_for_a_checksum_tail() {
+        assert_eq!(EXT4_EXTENTS_PER_BLOCK, 340);
+        assert_eq!(EXT4_INDEXES_PER_BLOCK, 340);
+        assert!(
+            std::mem::size_of::<Ext4ExtentHeader>()
+                + EXT4_EXTENTS_PER_BLOCK * std::mem::size_of::<Ext4Extent>()
+                <= BLOCK_SIZE
+        );
+        assert_eq!(
+            std::mem::size_of::<Ext4ExtentHeader>()
+                + EXT4_EXTENTS_PER_BLOCK * std::mem::size_of::<Ext4Extent>()
+                + EXT4_EXTENT_TAIL_SIZE,
+            BLOCK_SIZE
+        );
     }
 }
 

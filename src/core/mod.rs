@@ -647,7 +647,7 @@ impl Ext4ImageBuilder {
         // Level 1+: External index blocks containing Ext4ExtentIdx
         while current_indices.len() > EXT4_EXTENTS_IN_INODE {
             let mut next_level_indices = Vec::new();
-            for chunk in current_indices.chunks(EXT4_EXTENTS_PER_BLOCK) {
+            for chunk in current_indices.chunks(EXT4_INDEXES_PER_BLOCK) {
                 let meta_blk = self.allocate_free_blocks(preferred_group, 1)?;
                 metadata_blocks_count += 1;
 
@@ -655,7 +655,7 @@ impl Ext4ImageBuilder {
                 let header = Ext4ExtentHeader {
                     eh_magic: EXT4_EH_MAGIC,
                     eh_entries: chunk.len() as u16,
-                    eh_max: EXT4_EXTENTS_PER_BLOCK as u16,
+                    eh_max: EXT4_INDEXES_PER_BLOCK as u16,
                     eh_depth: current_depth,
                     eh_generation: 0,
                 };
