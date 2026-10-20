@@ -17,7 +17,7 @@ impl Ext4ImageBuilder {
         meta: &PosixMetadata,
     ) -> Result<u32> {
         Self::validate_name(name)?;
-        let expansion_blocks = self.dir_expansion_blocks_required(parent, name)?;
+        let expansion_blocks = self.estimate_dir_expansion_blocks(parent, name)?;
 
         let target_bytes = target.as_bytes();
         // Match ext2fs_symlink(): the terminating NUL must fit in one block,

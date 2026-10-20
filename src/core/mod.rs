@@ -1,6 +1,13 @@
 use anyhow::Result;
-use std::{fs::File, io::Write};
+use std::{
+    collections::HashMap,
+    fs::{File, OpenOptions},
+    io::Write,
+    ops::{Deref, DerefMut},
+    path::{Path, PathBuf},
+};
 
+use memmap2::{MmapMut, MmapOptions};
 use zerocopy::IntoBytes;
 
 use crate::ext4::*;
@@ -23,17 +30,82 @@ pub struct Ext4ImageBuilder {
     pub superblock: Ext4SuperBlock,
     pub group_descriptors: Vec<Ext4GroupDesc>,
     pub groups: Vec<Ext4BlockGroup>,
-    pub disk_data: Vec<u8>,
+    pub disk_data: DiskData,
+    /// Next bitmap positions to probe, avoiding a full bitmap rescan for
+    /// every imported entry.
+    pub(crate) next_block_hints: Vec<usize>,
+    pub(crate) next_inode_hints: Vec<usize>,
+    /// Cached names and append slots for linear directories only. Indexed
+    /// directories deliberately bypass this cache and use htree lookup.
+    pub(crate) directory_caches: HashMap<u32, directory::DirectoryCache>,
+}
+
+/// Mutable image bytes backed either by memory (primarily tests and library
+/// compatibility) or by the destination file used for streamed image builds.
+pub enum DiskData {
+    Memory(Vec<u8>),
+    File { mapping: MmapMut, path: PathBuf },
+}
+
+impl Deref for DiskData {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Memory(data) => data,
+            Self::File { mapping, .. } => mapping,
+        }
+    }
+}
+
+impl DerefMut for DiskData {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        match self {
+            Self::Memory(data) => data,
+            Self::File { mapping, .. } => mapping,
+        }
+    }
 }
 
 impl Ext4ImageBuilder {
     /// Creates an in-memory ext4 image builder of `size_mb`; returns initialized filesystem state.
     pub fn new(size_mb: usize) -> Self {
+        let image_size_bytes = size_mb * 1024 * 1024;
+        Self::new_with_storage(
+            image_size_bytes,
+            DiskData::Memory(vec![0; image_size_bytes]),
+        )
+    }
+
+    /// Creates an image directly in `output_path`. The mapping is file-backed,
+    /// so imported payload pages can be flushed instead of retaining a second
+    /// complete image-sized heap allocation.
+    pub fn new_file(size_mb: usize, output_path: impl AsRef<Path>) -> std::io::Result<Self> {
+        let image_size_bytes = size_mb
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| std::io::Error::other("image size overflow"))?;
+        let path = output_path.as_ref().to_owned();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(&path)?;
+        file.set_len(image_size_bytes as u64)?;
+        // the file remains at its fixed length for the lifetime of the
+        // mapping, and all access is mediated through the uniquely owned MmapMut.
+        let mapping = unsafe { MmapOptions::new().map_mut(&file)? };
+        Ok(Self::new_with_storage(
+            image_size_bytes,
+            DiskData::File { mapping, path },
+        ))
+    }
+
+    fn new_with_storage(image_size_bytes: usize, disk_data: DiskData) -> Self {
         if BYTES_PER_INODE_RATIO < BLOCK_SIZE {
             panic!("BYTES_PER_INODE_RATIO must be greater than or equal to BLOCK_SIZE");
         }
 
-        let image_size_bytes = size_mb * 1024 * 1024;
         let blocks_number = image_size_bytes / BLOCK_SIZE;
 
         let block_groups_number = blocks_number.div_ceil(BLOCKS_PER_GROUP);
@@ -55,7 +127,7 @@ impl Ext4ImageBuilder {
         let total_inodes = inodes_per_group * block_groups_number;
 
         let mut superblock = Ext4SuperBlock::default();
-        // Directory-index hashes must be seeded with a random value each run
+        // Calculate a random seed for the directory-index hashes
         let mut hash_seed_bytes = [0u8; 16];
         getrandom::fill(&mut hash_seed_bytes)
             .expect("the operating system must provide random bytes for the ext4 hash seed");
@@ -71,7 +143,7 @@ impl Ext4ImageBuilder {
         superblock.s_clusters_per_group = BLOCKS_PER_GROUP as u32;
         superblock.s_inodes_per_group = inodes_per_group as u32;
 
-        // 4. Build groups and group descriptor arrays
+        // Build groups and group descriptor arrays
         let mut groups = Vec::with_capacity(block_groups_number);
         let mut group_descriptors = Vec::with_capacity(block_groups_number);
 
@@ -87,13 +159,12 @@ impl Ext4ImageBuilder {
                 BLOCKS_PER_GROUP
             };
 
-            let block_bitmap_bytes = BLOCKS_PER_GROUP / 8;
             groups.push(Ext4BlockGroup {
                 group_id: group_idx as u32,
                 blocks_count: group_blocks as u32,
-                block_bitmap: vec![0u8; block_bitmap_bytes],
-                // The on-disk inode bitmap occupies one complete block.  Keep
-                // that entire block so its unused trailing bits can be set.
+                // The on-disk inode/block bitmaps occupie one complete block.
+                // During init, the unused bits will be padded with 1s
+                block_bitmap: vec![0u8; BLOCKS_PER_GROUP / 8],
                 inode_bitmap: vec![0u8; BLOCKS_PER_GROUP / 8],
                 inode_table: vec![Ext4Inode::default(); inodes_per_group],
                 free_blocks_count: group_blocks as u16,
@@ -120,7 +191,10 @@ impl Ext4ImageBuilder {
             superblock,
             group_descriptors,
             groups,
-            disk_data: vec![0u8; image_size_bytes],
+            disk_data,
+            next_block_hints: vec![0; block_groups_number],
+            next_inode_hints: vec![0; block_groups_number],
+            directory_caches: HashMap::new(),
         };
 
         builder.init_layout();
@@ -136,6 +210,7 @@ impl Ext4ImageBuilder {
         self.groups[group_idx].free_blocks_count -= 1;
         self.group_descriptors[group_idx].bg_free_blocks_count_lo -= 1;
         self.superblock.s_free_blocks_count_lo -= 1;
+        self.next_block_hints[group_idx] = self.next_block_hints[group_idx].max(block as usize + 1);
     }
 
     /// Marks one inode allocated and updates accounting; returns no value.
@@ -148,6 +223,8 @@ impl Ext4ImageBuilder {
         self.groups[group].free_inodes_count -= 1;
         self.group_descriptors[group].bg_free_inodes_count_lo -= 1;
         self.superblock.s_free_inodes_count -= 1;
+        self.next_inode_hints[group] =
+            self.next_inode_hints[group].max(index_in_group as usize + 1);
     }
 
     /// Returns whether a block group contains a sparse-super backup.
@@ -225,7 +302,7 @@ impl Ext4ImageBuilder {
                 self.groups[group_idx].block_bitmap[local_blk / 8] |= 1 << (local_blk % 8);
             }
 
-            // Every inode bitmap is a full block too.  e2fsck requires all
+            // Every inode bitmap is a full block too. e2fsck requires all
             // bits after s_inodes_per_group to be set as padding.
             for local_inode in inodes_per_group..BLOCKS_PER_GROUP {
                 self.groups[group_idx].inode_bitmap[local_inode / 8] |= 1 << (local_inode % 8);
@@ -270,9 +347,8 @@ impl Ext4ImageBuilder {
         }
     }
 
-    /// Reserve a contiguous extent, preferring the inode's block group and
-    /// wrapping to later groups when necessary.
-    /// Allocates contiguous free blocks in a preferred group; returns the first physical block number.
+    /// Reserves a contiguous extent near `preferred_group`, beginning at the
+    /// group's allocation cursor and wrapping to reclaimed blocks if needed.
     pub(crate) fn allocate_free_blocks(
         &mut self,
         preferred_group: usize,
@@ -283,10 +359,36 @@ impl Ext4ImageBuilder {
         }
         for delta in 0..self.groups.len() {
             let group = (preferred_group + delta) % self.groups.len();
+            if u32::from(self.groups[group].free_blocks_count) < blocks_needed {
+                continue;
+            }
             let limit = self.groups[group].blocks_count as usize;
-            let mut candidate_start = 0;
+            let hint = self.next_block_hints[group].min(limit);
+
+            // Directories and extent-tree metadata overwhelmingly request one
+            // block. Search 64 bitmap bits at a time instead of interpreting
+            // every allocated bit individually.
+            if blocks_needed == 1 {
+                let bitmap = &self.groups[group].block_bitmap;
+                if let Some(block) = find_next_free_bit(bitmap, hint, limit)
+                    .or_else(|| find_next_free_bit(bitmap, 0, hint))
+                {
+                    self.groups[group].block_bitmap[block / 8] |= 1 << (block % 8);
+                    self.groups[group].free_blocks_count -= 1;
+                    self.group_descriptors[group].bg_free_blocks_count_lo -= 1;
+                    self.superblock.s_free_blocks_count_lo -= 1;
+                    self.next_block_hints[group] = block + 1;
+                    return Ok((group * BLOCKS_PER_GROUP + block) as u32);
+                }
+                continue;
+            }
+
+            let mut candidate_start = hint;
             let mut contiguous_free = 0;
-            for bit in 0..limit {
+            for bit in (hint..limit).chain(0..hint) {
+                if bit == 0 {
+                    contiguous_free = 0;
+                }
                 // if block is free, if contiguous_free is 0, set candidate_start to bit, otherwise increment contiguous_free
                 if self.groups[group].block_bitmap[bit / 8] & (1 << (bit % 8)) == 0 {
                     if contiguous_free == 0 {
@@ -301,6 +403,7 @@ impl Ext4ImageBuilder {
                         self.group_descriptors[group].bg_free_blocks_count_lo -=
                             blocks_needed as u16;
                         self.superblock.s_free_blocks_count_lo -= blocks_needed;
+                        self.next_block_hints[group] = candidate_start + blocks_needed as usize;
                         return Ok((group * BLOCKS_PER_GROUP + candidate_start) as u32);
                     }
                 } else {
@@ -313,8 +416,8 @@ impl Ext4ImageBuilder {
         ))
     }
 
-    /// Releases one previously allocated absolute block.
-    /// Releases one allocated physical block and updates accounting; returns `Ok(())` or an error.
+    /// Releases an allocated block, updates accounting, and rewinds the group
+    /// allocation cursor when the released block precedes it.
     pub(crate) fn release_block(&mut self, block: u32) -> Result<()> {
         let group = (block as usize) / BLOCKS_PER_GROUP;
         let local = (block as usize) % BLOCKS_PER_GROUP;
@@ -330,6 +433,7 @@ impl Ext4ImageBuilder {
         self.groups[group].free_blocks_count += 1;
         self.group_descriptors[group].bg_free_blocks_count_lo += 1;
         self.superblock.s_free_blocks_count_lo += 1;
+        self.next_block_hints[group] = self.next_block_hints[group].min(local);
         Ok(())
     }
 
@@ -554,9 +658,25 @@ impl Ext4ImageBuilder {
             self.disk_data[ib_offset..ib_offset + group.inode_bitmap.len()]
                 .copy_from_slice(&group.inode_bitmap);
         }
-        // Write out to disk
-        let mut file = File::create(output_path)?;
-        file.write_all(&self.disk_data)?;
+        // Flush file-backed pages, or write the compatibility in-memory image.
+        match &mut self.disk_data {
+            DiskData::Memory(data) => {
+                let mut file = File::create(output_path)?;
+                file.write_all(data)?;
+            }
+            DiskData::File { mapping, path } => {
+                if path != Path::new(output_path) {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "file-backed image targets {}, not {output_path}",
+                            path.display()
+                        ),
+                    ));
+                }
+                mapping.flush()?;
+            }
+        }
         Ok(())
     }
 
@@ -694,5 +814,70 @@ impl Ext4ImageBuilder {
         }
 
         Ok(metadata_blocks_count)
+    }
+}
+
+/// Finds the first zero bitmap bit in `[start, end)`, scanning full machine
+/// words where possible while preserving ascending-bit allocation order.
+fn find_next_free_bit(bitmap: &[u8], start: usize, end: usize) -> Option<usize> {
+    let mut bit = start;
+    while bit < end && !bit.is_multiple_of(64) {
+        if bitmap[bit / 8] & (1 << (bit % 8)) == 0 {
+            return Some(bit);
+        }
+        bit += 1;
+    }
+
+    while bit + 64 <= end {
+        let byte = bit / 8;
+        let word = u64::from_le_bytes(bitmap[byte..byte + 8].try_into().unwrap());
+        if word != u64::MAX {
+            return Some(bit + (!word).trailing_zeros() as usize);
+        }
+        bit += 64;
+    }
+
+    while bit < end {
+        if bitmap[bit / 8] & (1 << (bit % 8)) == 0 {
+            return Some(bit);
+        }
+        bit += 1;
+    }
+    None
+}
+
+#[cfg(test)]
+mod bitmap_tests {
+    use super::{DiskData, Ext4ImageBuilder, find_next_free_bit};
+
+    #[test]
+    fn free_bit_search_respects_range_and_bit_order() {
+        let mut bitmap = [u8::MAX; 24];
+        bitmap[1] &= !(1 << 3); // bit 11
+        bitmap[9] &= !(1 << 5); // bit 77
+        bitmap[20] &= !(1 << 1); // bit 161
+
+        assert_eq!(find_next_free_bit(&bitmap, 0, 192), Some(11));
+        assert_eq!(find_next_free_bit(&bitmap, 12, 160), Some(77));
+        assert_eq!(find_next_free_bit(&bitmap, 78, 192), Some(161));
+        assert_eq!(find_next_free_bit(&bitmap, 12, 77), None);
+    }
+
+    #[test]
+    fn file_backed_builder_flushes_without_an_image_sized_heap_buffer() -> anyhow::Result<()> {
+        let path =
+            std::env::temp_dir().join(format!("ext4kit-file-backed-{}.img", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut builder = Ext4ImageBuilder::new_file(16, &path)?;
+            assert!(matches!(builder.disk_data, DiskData::File { .. }));
+            builder.create_root_dir()?;
+            builder.create_lost_and_found()?;
+            builder.reserve_inodes();
+            builder.write_to_file(path.to_str().unwrap())?;
+        }
+        assert_eq!(std::fs::metadata(&path)?.len(), 16 * 1024 * 1024);
+        std::fs::remove_file(path)?;
+        Ok(())
     }
 }

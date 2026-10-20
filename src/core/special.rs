@@ -20,7 +20,7 @@ impl Ext4ImageBuilder {
         meta: &PosixMetadata,
     ) -> Result<u32> {
         Self::validate_name(name)?;
-        let expansion_blocks = self.dir_expansion_blocks_required(parent, name)?;
+        let expansion_blocks = self.estimate_dir_expansion_blocks(parent, name)?;
 
         let xattrs = prepare_xattrs(&meta.xattrs)?;
         // it finds the next free inode starting from the block of the parent directory, but still do not allocate it

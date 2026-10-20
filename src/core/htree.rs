@@ -545,14 +545,14 @@ impl Ext4ImageBuilder {
                     }
                     let actual = align4(8 + e.name_len as usize);
                     if found.is_none() && len >= actual + needed {
-                        found = Some(DirSlot::Split {
+                        found = Some(DirSlot::SplitActiveRecord {
                             offset: base + off,
                             actual,
                             rec_len: len,
                         });
                     }
                 } else if found.is_none() && len >= needed {
-                    found = Some(DirSlot::Reuse {
+                    found = Some(DirSlot::EmptyRecord {
                         offset: base + off,
                         rec_len: len,
                     });

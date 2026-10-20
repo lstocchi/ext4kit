@@ -5,7 +5,7 @@ pub use crate::xattr::parse_xattr_name;
 use crate::xattr::posix_acl_to_ext4_disk;
 use crate::xattr::prepare_xattrs;
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use zerocopy::{FromBytes, IntoBytes};
 
 /// Metadata collected from an OCI layer or a host filesystem.
@@ -27,19 +27,36 @@ pub(crate) struct PreparedXattr {
     pub(crate) value: Vec<u8>,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DirSlot {
     /// An active directory entry with slack space that can be split.
-    Split {
+    SplitActiveRecord {
         offset: usize,
         actual: usize,
         rec_len: usize,
     },
     /// An unused/empty entry (inode == 0) that can be reused directly.
-    Reuse { offset: usize, rec_len: usize },
+    EmptyRecord { offset: usize, rec_len: usize },
+}
+
+/// Import-time cache for a linear directory. Htree directories must never use
+/// it as their leaf selection and duplicate detection are hash based.
+#[derive(Default)]
+pub(crate) struct DirectoryCache {
+    existing_names: HashSet<String>,
+    /// Caches an available slot found in the directory's last block.
+    /// Subsequent file additions can reuse this cached slot to skip
+    /// re-scanning earlier blocks.
+    next_append_slot: Option<DirSlot>,
 }
 
 impl Ext4ImageBuilder {
+    /// Discards linear-directory import state after callers directly alter its
+    /// on-disk data or metadata. Indexed directories do not populate it.
+    pub fn invalidate_directory_cache(&mut self, directory: u32) {
+        self.directory_caches.remove(&directory);
+    }
+
     /// Validates one ext4 directory-entry component; returns `Ok(())` or a descriptive error.
     pub(crate) fn validate_name(name: &str) -> Result<()> {
         if name.is_empty() || name == "." || name == ".." || name.len() > 255 || name.contains('/')
@@ -79,7 +96,7 @@ impl Ext4ImageBuilder {
     pub fn mkdir(&mut self, parent: u32, name: &str, meta: Option<&PosixMetadata>) -> Result<u32> {
         Self::validate_name(name)?;
 
-        let expansion_blocks = self.dir_expansion_blocks_required(parent, name)?;
+        let expansion_blocks = self.estimate_dir_expansion_blocks(parent, name)?;
 
         let default_meta = PosixMetadata::default();
         let meta = meta.unwrap_or(&default_meta);
@@ -134,15 +151,16 @@ impl Ext4ImageBuilder {
 
         self.groups[group].inode_table[index_in_group] = inode;
         self.group_descriptors[group].bg_used_dirs_count_lo += 1;
+        // add the new directory entry to the parent
         self.add_dir_entry(parent, name, ino, EXT4_FT_DIR)?;
         let (pgroup, pindex_in_group) = self.inode_location(parent);
         self.groups[pgroup].inode_table[pindex_in_group].i_links_count += 1;
         Ok(ino)
     }
 
-    /// Non-mutating scan that plans the exact physical block runs for `blocks_needed`.
-    /// Each run is capped at 32,768 blocks to comply with ext4 initialized extent limits.
-    /// Plans uncommitted physical block runs for a payload; returns contiguous `(start, length)` runs.
+    /// Plans uncommitted physical runs for `blocks_needed`, starting from each
+    /// group's allocation cursor before wrapping to reclaimed earlier blocks.
+    /// Runs are capped at 32,768 blocks for ext4 initialized extents.
     pub(crate) fn plan_data_blocks(
         &self,
         preferred_group: usize,
@@ -173,24 +191,25 @@ impl Ext4ImageBuilder {
             }
 
             let limit = self.groups[group].blocks_count as usize;
-            let mut bit = 0;
+            let hint = self.next_block_hints[group].min(limit);
+            for (range_start, range_end) in [(hint, limit), (0, hint)] {
+                let mut bit = range_start;
+                while bit < range_end && blocks_needed > 0 {
+                    // If block is free in bitmap
+                    if self.groups[group].block_bitmap[bit / 8] & (1 << (bit % 8)) == 0 {
+                        let run_start = bit;
+                        let max_run =
+                            (blocks_needed.min(32768) as usize).min(range_end - run_start);
+                        let mut run_len = 0;
 
-            while bit < limit && blocks_needed > 0 {
-                // If block is free in bitmap
-                if self.groups[group].block_bitmap[bit / 8] & (1 << (bit % 8)) == 0 {
-                    let run_start = bit;
-                    let max_run = (blocks_needed.min(32768) as usize).min(limit - run_start);
-                    let mut run_len = 0;
+                        while run_len < max_run
+                            && (self.groups[group].block_bitmap[(run_start + run_len) / 8]
+                                & (1 << ((run_start + run_len) % 8)))
+                                == 0
+                        {
+                            run_len += 1;
+                        }
 
-                    while run_len < max_run
-                        && (self.groups[group].block_bitmap[(run_start + run_len) / 8]
-                            & (1 << ((run_start + run_len) % 8)))
-                            == 0
-                    {
-                        run_len += 1;
-                    }
-
-                    if run_len > 0 {
                         let phys_block = (group * BLOCKS_PER_GROUP + run_start) as u32;
                         planned_runs.push((phys_block, run_len as u32));
                         blocks_needed -= run_len as u32;
@@ -198,8 +217,6 @@ impl Ext4ImageBuilder {
                     } else {
                         bit += 1;
                     }
-                } else {
-                    bit += 1;
                 }
             }
         }
@@ -213,7 +230,7 @@ impl Ext4ImageBuilder {
         Ok(planned_runs)
     }
 
-    /// Marks previously planned runs allocated; returns no value because allocation state is mutated.
+    /// Commits planned runs and advances each affected group's allocation cursor.
     pub(crate) fn commit_data_blocks(&mut self, planned_runs: &[(u32, u32)]) {
         for &(phys_start, len) in planned_runs {
             let group = (phys_start as usize) / BLOCKS_PER_GROUP;
@@ -226,22 +243,42 @@ impl Ext4ImageBuilder {
             self.groups[group].free_blocks_count -= len as u16;
             self.group_descriptors[group].bg_free_blocks_count_lo -= len as u16;
             self.superblock.s_free_blocks_count_lo -= len;
+            self.next_block_hints[group] = local_start + len as usize;
         }
     }
 
     /// Scans a directory leaf to verify `name` is unique, finding an available slot.
     /// Finds reusable directory-entry space while rejecting duplicate names; returns a slot or `None` when full.
-    fn find_dir_slot(&self, parent: u32, name: &str) -> Result<Option<DirSlot>> {
-        Self::validate_name(name)?;
+    fn find_dir_slot(&mut self, parent: u32, name: &str) -> Result<Option<DirSlot>> {
         if self.dir_is_indexed(parent)? {
             return self.find_htree_slot(parent, name);
         }
+
         let name_bytes = name.as_bytes();
         let needed = align4(8 + name_bytes.len());
-        let blocks = self.get_dir_blocks(parent)?;
-        let mut found_slot = None;
 
-        for &block in &blocks {
+        if let Some(cache) = self.directory_caches.get(&parent) {
+            if cache.existing_names.contains(name) {
+                return Err(anyhow::anyhow!("directory entry {name:?} already exists"));
+            }
+            if let Some(slot) = cache.next_append_slot.filter(|slot| match slot {
+                DirSlot::SplitActiveRecord {
+                    actual, rec_len, ..
+                } => *rec_len >= *actual + needed,
+                DirSlot::EmptyRecord { rec_len, .. } => *rec_len >= needed,
+            }) {
+                return Ok(Some(slot));
+            }
+            // An exhausted next_append_slot cannot exclude the possibility of an earlier reusable record.
+            self.directory_caches.remove(&parent);
+        }
+
+        let blocks = self.get_dir_blocks(parent)?;
+        let mut first_available_slot = None;
+        let mut is_in_last_dir_block = false;
+        let mut names = HashSet::new();
+
+        for (block_index, &block) in blocks.iter().enumerate() {
             let base = block as usize * BLOCK_SIZE;
             let mut off = 0;
             while off < BLOCK_SIZE {
@@ -261,6 +298,13 @@ impl Ext4ImageBuilder {
                 }
 
                 if e.inode != 0 {
+                    let entry_name = std::str::from_utf8(
+                        &self.disk_data[base + off + 8..base + off + 8 + e.name_len as usize],
+                    )
+                    .map_err(|_| {
+                        anyhow::anyhow!("directory inode {parent} contains a non-UTF-8 name")
+                    })?;
+                    names.insert(entry_name.to_owned());
                     if e.name_len as usize == name_bytes.len()
                         && &self.disk_data[base + off + 8..base + off + 8 + e.name_len as usize]
                             == name_bytes
@@ -268,18 +312,20 @@ impl Ext4ImageBuilder {
                         return Err(anyhow::anyhow!("directory entry {name:?} already exists"));
                     }
                     let actual = align4(8 + e.name_len as usize);
-                    if found_slot.is_none() && len >= actual + needed {
-                        found_slot = Some(DirSlot::Split {
+                    if first_available_slot.is_none() && len >= actual + needed {
+                        first_available_slot = Some(DirSlot::SplitActiveRecord {
                             offset: base + off,
                             actual,
                             rec_len: len,
                         });
+                        is_in_last_dir_block = block_index + 1 == blocks.len();
                     }
-                } else if found_slot.is_none() && len >= needed {
-                    found_slot = Some(DirSlot::Reuse {
+                } else if first_available_slot.is_none() && len >= needed {
+                    first_available_slot = Some(DirSlot::EmptyRecord {
                         offset: base + off,
                         rec_len: len,
                     });
+                    is_in_last_dir_block = block_index + 1 == blocks.len();
                 }
                 off += len;
             }
@@ -289,7 +335,14 @@ impl Ext4ImageBuilder {
                 ));
             }
         }
-        Ok(found_slot)
+        self.directory_caches.insert(
+            parent,
+            DirectoryCache {
+                existing_names: names,
+                next_append_slot: first_available_slot.filter(|_| is_in_last_dir_block),
+            },
+        );
+        Ok(first_available_slot)
     }
 
     /// Adds one initialized data block to a directory; returns the new physical block number.
@@ -302,19 +355,19 @@ impl Ext4ImageBuilder {
 
         let mut leaf_extents = self.get_inode_extents(inode)?;
 
+        // When write_extent_tree runs later, it serializes a completely new replacement tree.
+        // We gather the old tree metadata block numbers so they can be safely reclaimed.
         let mut old_tree_blocks = Vec::new();
         self.collect_extent_tree_blocks(&inode.i_block, &mut old_tree_blocks)?;
 
-        // write_extent_tree currently serializes a replacement tree, so reserve
-        // its full metadata footprint before modifying allocation state.
+        // Calculate the number of extents and tree metadata blocks needed in the worst scenario
+        // and check if we have enough free blocks to allocate them.
         let existing_extents = leaf_extents.len();
         let potential_extents = existing_extents + 1;
         let potential_tree_meta = Self::max_extent_tree_blocks(potential_extents) as u32;
-
-        // Preflight check: one data block plus the full replacement tree.
         self.ensure_allocation_capacity(1, potential_tree_meta)?;
 
-        // Allocate block and initialize with an empty entry covering the full block
+        // Allocate a new data block and initialize it with an empty entry covering the full block
         let new_blk = self.allocate_free_blocks(group, 1)?;
         let mut empty_dir_block = vec![0u8; BLOCK_SIZE];
         let empty_header = Ext4DirEntry2Header {
@@ -327,10 +380,7 @@ impl Ext4ImageBuilder {
         let disk_offset = new_blk as usize * BLOCK_SIZE;
         self.disk_data[disk_offset..disk_offset + BLOCK_SIZE].copy_from_slice(&empty_dir_block);
 
-        // Append to existing extent if contiguous, otherwise push a new extent
-        let current_size = self.groups[group].inode_table[index_in_group].i_size_lo;
-        let logical_block = current_size / BLOCK_SIZE as u32;
-
+        // If the last extent is contiguous with the new block, merge them
         let mut merged = false;
         if let Some(last) = leaf_extents.last_mut() {
             if last.ee_start_lo + (last.ee_len as u32) == new_blk && (last.ee_len as usize) < 32768
@@ -340,6 +390,8 @@ impl Ext4ImageBuilder {
             }
         }
         if !merged {
+            let current_size = self.groups[group].inode_table[index_in_group].i_size_lo;
+            let logical_block = current_size / BLOCK_SIZE as u32;
             leaf_extents.push(Ext4Extent {
                 ee_block: logical_block,
                 ee_len: 1,
@@ -368,11 +420,20 @@ impl Ext4ImageBuilder {
         dir_inode.i_osd2[0..2].copy_from_slice(&high_sectors.to_le_bytes());
 
         self.groups[group].inode_table[index_in_group] = dir_inode;
+        if !self.dir_is_indexed(dir_ino)? {
+            self.directory_caches
+                .entry(dir_ino)
+                .or_default()
+                .next_append_slot = Some(DirSlot::EmptyRecord {
+                offset: disk_offset,
+                rec_len: BLOCK_SIZE,
+            });
+        }
         Ok(new_blk)
     }
 
-    /// Adds a directory entry to `parent`; returns `Ok(())` after expanding the directory when needed.
-    /// when all existing blocks are full.
+    /// Adds a directory entry to `parent`, using the linear cache only before
+    /// the directory is promoted to an htree.
     pub fn add_dir_entry(
         &mut self,
         parent: u32,
@@ -385,15 +446,20 @@ impl Ext4ImageBuilder {
             Some(slot) => slot,
             None => {
                 if !self.dir_is_indexed(parent)? {
+                    // The directory is permanently switching lookup models.
+                    self.directory_caches.remove(&parent);
                     return self.make_indexed_and_insert(parent, name, child, file_type);
                 }
                 return self.split_htree_leaf_and_insert(parent, name, child, file_type);
             }
         };
-
+        let is_next_slot_cached = self
+            .directory_caches
+            .get(&parent)
+            .is_some_and(|cache| cache.next_append_slot == Some(slot));
         let bytes = name.as_bytes();
         match slot {
-            DirSlot::Split {
+            DirSlot::SplitActiveRecord {
                 offset,
                 actual,
                 rec_len,
@@ -412,8 +478,16 @@ impl Ext4ImageBuilder {
                     .as_bytes(),
                 );
                 self.disk_data[new_offset + 8..new_offset + 8 + bytes.len()].copy_from_slice(bytes);
+                if let Some(cache) = self.directory_caches.get_mut(&parent) {
+                    cache.next_append_slot =
+                        is_next_slot_cached.then_some(DirSlot::SplitActiveRecord {
+                            offset: new_offset,
+                            actual: align4(8 + bytes.len()),
+                            rec_len: new_rec_len as usize,
+                        });
+                }
             }
-            DirSlot::Reuse { offset, rec_len } => {
+            DirSlot::EmptyRecord { offset, rec_len } => {
                 self.disk_data[offset..offset + 8].copy_from_slice(
                     Ext4DirEntry2Header {
                         inode: child,
@@ -424,15 +498,20 @@ impl Ext4ImageBuilder {
                     .as_bytes(),
                 );
                 self.disk_data[offset + 8..offset + 8 + bytes.len()].copy_from_slice(bytes);
+                if let Some(cache) = self.directory_caches.get_mut(&parent) {
+                    cache.next_append_slot = None;
+                }
             }
+        }
+        if let Some(cache) = self.directory_caches.get_mut(&parent) {
+            cache.existing_names.insert(name.to_owned());
         }
         Ok(())
     }
 
-    /// Calculates blocks required to add an entry, including possible growth metadata; returns that count.
-    /// This includes a conservative full replacement extent-tree footprint.
-    pub(crate) fn dir_expansion_blocks_required(&self, parent: u32, name: &str) -> Result<u32> {
-        Self::validate_name(name)?;
+    /// Calculates blocks required to add an entry, including possible growth
+    /// and replacement extent-tree metadata.
+    pub(crate) fn estimate_dir_expansion_blocks(&mut self, parent: u32, name: &str) -> Result<u32> {
         match self.find_dir_slot(parent, name)? {
             Some(_) => Ok(0),
             None => {
@@ -441,6 +520,9 @@ impl Ext4ImageBuilder {
                 let data_blocks: u32 = if self.dir_is_indexed(parent)? {
                     self.htree_growth_blocks(parent, name)?
                 } else {
+                    // When a directory gets full and needs to grow, it is converted into an htree.
+                    // The original block becomes the index root, and its
+                    // entries are split across 2 newly allocated leaf blocks.
                     2
                 };
                 let tree_blocks =
@@ -747,10 +829,7 @@ mod tests {
 
         // Free the 5 blocks we want to use as fragmented targets
         for &blk in &fragmented_blocks {
-            let local = blk as usize % BLOCKS_PER_GROUP;
-            builder.groups[0].block_bitmap[local / 8] &= !(1 << (local % 8));
-            builder.groups[0].free_blocks_count += 1;
-            builder.superblock.s_free_blocks_count_lo += 1;
+            builder.release_block(blk).unwrap();
         }
 
         // Allocate a 5-block file that will consume the 5 isolated gaps

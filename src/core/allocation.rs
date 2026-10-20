@@ -23,20 +23,30 @@ impl Ext4ImageBuilder {
         self.groups[group as usize].inode_bitmap[byte_idx] & (1 << bit_idx) != 0
     }
 
-    /// Finds the next free inode, preferring the parent's block group; returns its inode number.
-    pub(crate) fn next_free_inode(&self, parent_dir_ino: Option<u32>) -> Result<u32> {
+    /// Finds a free inode near `parent_dir_ino`, probing from the group's
+    /// allocation cursor and wrapping only when reclaimed space requires it.
+    pub(crate) fn next_free_inode(&mut self, parent_dir_ino: Option<u32>) -> Result<u32> {
         let total_inodes = self.superblock.s_inodes_count;
         let inodes_per_group = self.superblock.s_inodes_per_group;
-        let start_ino = match parent_dir_ino {
-            Some(dir) if dir > 0 && dir <= total_inodes => {
-                ((dir - 1) / inodes_per_group) * inodes_per_group + 1
-            }
-            _ => 1,
-        };
+        let preferred_group = parent_dir_ino
+            .filter(|&dir| dir > 0 && dir <= total_inodes)
+            .map(|dir| ((dir - 1) / inodes_per_group) as usize)
+            .unwrap_or(0);
 
-        (start_ino..=total_inodes)
-            .chain(1..start_ino)
-            .find(|&ino| !self.is_inode_allocated(ino))
-            .ok_or_else(|| anyhow::anyhow!("No free inodes available"))
+        for delta in 0..self.groups.len() {
+            let group = (preferred_group + delta) % self.groups.len();
+            if self.groups[group].free_inodes_count == 0 {
+                continue;
+            }
+            let limit = inodes_per_group as usize;
+            let start = self.next_inode_hints[group].min(limit);
+            for index in (start..limit).chain(0..start) {
+                if self.groups[group].inode_bitmap[index / 8] & (1 << (index % 8)) == 0 {
+                    self.next_inode_hints[group] = index + 1;
+                    return Ok((group * limit + index + 1) as u32);
+                }
+            }
+        }
+        Err(anyhow::anyhow!("No free inodes available"))
     }
 }
