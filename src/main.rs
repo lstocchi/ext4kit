@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 use ext4kit::core::{Ext4ImageBuilder, HostTree};
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     path::PathBuf,
 };
 
@@ -68,13 +69,21 @@ fn main() -> anyhow::Result<()> {
     builder.reserve_inodes();
 
     let mut destination_inodes = HashMap::from([("/".to_owned(), ext4kit::ext4::EXT4_ROOT_INO)]);
-    for (index, addition) in additions.iter().enumerate() {
+    // Import a directory before anything that needs it as a destination.  This
+    // lets `--add b:/a` provide `/a/b` for a later `--add c:/a/b`.
+    let mut import_order: Vec<_> = (0..additions.len()).collect();
+    import_order.sort_by_key(|&index| additions[index].target().matches('/').count());
+    for index in import_order {
+        let addition = &additions[index];
         let destination_parent =
             ensure_destination_path(&mut builder, &addition.destination, &mut destination_inodes)?;
-        if let Some(trees) = &host_trees {
-            builder.import_host_tree(destination_parent, &trees[index])?;
+        let inode = if let Some(trees) = &host_trees {
+            builder.import_host_tree(destination_parent, &trees[index])?
         } else {
-            builder.import_host_path_streaming(destination_parent, &addition.source)?;
+            builder.import_host_path_streaming(destination_parent, &addition.source)?
+        };
+        if addition.is_directory()? {
+            destination_inodes.insert(addition.target(), inode);
         }
     }
 
@@ -93,6 +102,33 @@ struct Addition {
     destination: String,
 }
 
+impl Addition {
+    fn target(&self) -> String {
+        let name = self
+            .source
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("additions validate their source name while parsing");
+        if self.destination == "/" {
+            format!("/{name}")
+        } else {
+            format!("{}/{name}", self.destination)
+        }
+    }
+
+    fn is_directory(&self) -> anyhow::Result<bool> {
+        Ok(fs::symlink_metadata(&self.source)
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "cannot inspect add source {}: {error}",
+                    self.source.display()
+                )
+            })?
+            .file_type()
+            .is_dir())
+    }
+}
+
 /// Parses `host-path` or `host-path:/absolute/image/path` into one addition.
 /// A bare host path targets the image root; a `C:/` Windows drive prefix is
 /// not treated as a destination separator.
@@ -107,25 +143,49 @@ fn parse_add(add: &str) -> anyhow::Result<Addition> {
             if source.is_empty() {
                 anyhow::bail!("add source cannot be empty");
             }
+            let source = PathBuf::from(source);
+            validate_add_source(&source)?;
             Ok(Addition {
-                source: PathBuf::from(source),
+                source,
                 destination,
             })
         }
-        None => Ok(Addition {
-            source: PathBuf::from(add),
-            destination: "/".to_owned(),
-        }),
+        None => {
+            let source = PathBuf::from(add);
+            validate_add_source(&source)?;
+            Ok(Addition {
+                source,
+                destination: "/".to_owned(),
+            })
+        }
+    }
+}
+
+/// Rejects filesystem roots, which have no name to place in the image.
+fn validate_add_source(source: &PathBuf) -> anyhow::Result<()> {
+    match source.file_name().and_then(|name| name.to_str()) {
+        Some(_) => Ok(()),
+        None if source.parent().is_none() => anyhow::bail!(
+            "add source is a filesystem root and cannot be imported as a named image entry: {}",
+            source.display()
+        ),
+        None => anyhow::bail!(
+            "add source has no valid UTF-8 file name: {}",
+            source.display()
+        ),
     }
 }
 
 /// Returns whether `index` is the `:/` portion of a Windows `C:/` prefix.
 fn is_windows_drive_separator(value: &str, index: usize) -> bool {
-    index == 1
-        && value
-            .as_bytes()
-            .first()
-            .is_some_and(u8::is_ascii_alphabetic)
+    let Some(&drive) = value.as_bytes().get(index.saturating_sub(1)) else {
+        return false;
+    };
+    if !drive.is_ascii_alphabetic() {
+        return false;
+    }
+    let prefix = &value[..index - 1];
+    prefix.is_empty() || prefix.ends_with("\\\\?\\") || prefix.ends_with("//?/")
 }
 
 /// Canonicalizes a CLI destination to an absolute slash-separated image path.
@@ -202,25 +262,11 @@ fn reject_target_collisions(
 ) -> anyhow::Result<()> {
     let mut targets = HashSet::new();
     for addition in additions {
-        let name = addition
-            .source
-            .file_name()
-            .and_then(|name| name.to_str())
-            .ok_or_else(|| {
-                anyhow::anyhow!(
-                    "add source has no valid UTF-8 file name: {}",
-                    addition.source.display()
-                )
-            })?;
-        let target = if addition.destination == "/" {
-            format!("/{name}")
-        } else {
-            format!("{}/{name}", addition.destination)
-        };
+        let target = addition.target();
         if !targets.insert(target.clone()) {
             anyhow::bail!("multiple additions target {target}");
         }
-        if destination_directories.contains(&target) {
+        if destination_directories.contains(&target) && !addition.is_directory()? {
             anyhow::bail!(
                 "addition targets {target}, which is also needed as another addition's destination directory"
             );
@@ -231,8 +277,11 @@ fn reject_target_collisions(
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, parse_add};
+    use super::{
+        Addition, Cli, Command, destination_directories, parse_add, reject_target_collisions,
+    };
     use clap::Parser;
+    use std::{fs, path::PathBuf};
 
     #[test]
     fn accepts_explicit_image_size() {
@@ -266,5 +315,39 @@ mod tests {
         let addition = parse_add("C:/work/hosts").unwrap();
         assert_eq!(addition.source, std::path::PathBuf::from("C:/work/hosts"));
         assert_eq!(addition.destination, "/");
+    }
+
+    #[test]
+    fn extended_windows_drive_path_is_not_a_destination_separator() {
+        let addition = parse_add(r"\\?\C:/work/hosts").unwrap();
+        assert_eq!(addition.source, PathBuf::from(r"\\?\C:/work/hosts"));
+        assert_eq!(addition.destination, "/");
+    }
+
+    #[test]
+    fn root_add_source_has_a_specific_error() {
+        let error = parse_add("/").unwrap_err();
+        assert!(error.to_string().contains("filesystem root"));
+    }
+
+    #[test]
+    fn directory_target_can_supply_another_destination_path() {
+        let base = std::env::temp_dir().join(format!("ext4kit-main-test-{}", std::process::id()));
+        let directory = base.join("b");
+        fs::create_dir_all(&directory).unwrap();
+        let additions = vec![
+            Addition {
+                source: directory,
+                destination: "/a".to_owned(),
+            },
+            Addition {
+                source: PathBuf::from("c"),
+                destination: "/a/b".to_owned(),
+            },
+        ];
+        let directories = destination_directories(&additions);
+        assert!(directories.contains("/a/b"));
+        assert!(reject_target_collisions(&additions, &directories).is_ok());
+        fs::remove_dir_all(base).unwrap();
     }
 }
