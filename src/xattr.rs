@@ -37,8 +37,9 @@ impl Ext4ImageBuilder {
         let (mut entry, mut value) = (32, BLOCK_SIZE);
         let mut block_hash = 0u32;
         for xattr in xattrs {
+            let aligned_value_len = align4(xattr.value.len());
             value = value
-                .checked_sub(align4(xattr.value.len()))
+                .checked_sub(aligned_value_len)
                 .ok_or(anyhow::anyhow!("xattrs exceed one filesystem block"))?;
             let entry_len = 16 + align4(xattr.suffix.len());
             if entry + entry_len + 4 > value {
@@ -57,6 +58,9 @@ impl Ext4ImageBuilder {
             block_hash = block_hash.rotate_left(16) ^ entry_hash;
             data[entry + 16..entry + 16 + xattr.suffix.len()]
                 .copy_from_slice(xattr.suffix.as_bytes());
+            // Values occupy an aligned extent on disk. Clear it explicitly so that
+            // alignment padding remains deterministic if this buffer is ever reused.
+            data[value..value + aligned_value_len].fill(0);
             data[value..value + xattr.value.len()].copy_from_slice(&xattr.value);
             entry += entry_len;
         }
