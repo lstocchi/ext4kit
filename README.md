@@ -6,34 +6,46 @@ It is intended to make application files available to Linux VMs through ext4 dis
 
 ## Status
 
-The formatter currently supports files, directories, symlinks, special nodes, extents, POSIX metadata, xattrs, and POSIX ACLs. OCI import, host-directory traversal, and a complete CLI are planned.
+The formatter supports files, directories, symlinks, special nodes, extents, POSIX metadata, xattrs, POSIX ACLs, and host-directory traversal. OCI import and a complete CLI are planned.
 
 ## Quick start
 
 ```powershell
-cargo run -- output.img
+cargo run -- create --add C:\path\to\source:/etc output.img
 ```
 
-This creates a 400 MiB demonstration image. The sample tree and image size currently live in `src/main.rs`.
-
-# Development and verification
-
-Run:
+By default, ext4kit scans the additions first and calculates an image size. To
+choose the image size yourself and import in a single streaming traversal, pass
+the size in MiB:
 
 ```powershell
-cargo fmt --check
-cargo test
+cargo run -- create --size 3200 --add C:\path\to\source:/etc output.img
 ```
 
-Validate generated images with:
+Both commands create `/etc/source` and import the contents of
+`C:\path\to\source` there. Add `:/destination` to place a source directory below
+an absolute path in the image. Omit it to create `/source` in the filesystem
+root. Without `--size`, the image size is calculated automatically
+from the source tree, including ext4 metadata and free space. Directory
+discovery is streamed and file payloads are copied directly
+into a ext4 file-backed image.
 
-```sh
-e2fsck -fn output.img
-debugfs -R 'ls -l /test_dir' output.img
-debugfs -R 'ea_list /test_dir/hello.txt' output.img
+Repeat `--add` to compose an image from several sources:
+
+```powershell
+cargo run -- create --add C:\work\hosts:/etc --add C:\work\app:/opt output.img
 ```
 
-`e2fsck -fn` must not propose repairs. Regenerate and inspect an image whenever allocation or metadata code changes.
+In library code, initialize the root directory and then call
+`builder.import_host_root(source)`, or use `import_host_directory(parent, source)`
+to create an appropriately named child directory beneath an existing ext4
+directory. Both methods return the imported directory inode. Regular files,
+directories, and symbolic links are imported without following links.
+
+Use `Ext4ImageBuilder::new_file(size_mib, output)` for file-backed construction.
+`Ext4ImageBuilder::new(size_mib)` remains available when an in-memory image is
+useful, such as small tests.
+
 
 `debugfs` should list `hello.txt` and display its `user.creator` xattr. Images
 containing symlinks should show them with type `120777` in `debugfs -R 'ls -l

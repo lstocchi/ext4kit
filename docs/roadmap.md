@@ -4,7 +4,7 @@ The intended end-to-end workflows are:
 
 1. Extract a root filesystem from an OCI image and write its files into a
    valid ext4 image.
-2. Copy or inject an application directory that lives on the Windows host
+2. Copy or inject an application directory that lives on the host
    into a valid ext4 image.
 3. Attach that image to a Linux VM, mount it as ext4, and run the application
    from the VM at native filesystem speed.
@@ -24,5 +24,4 @@ guest:
 mount -t ext4 /dev/vdb /mnt/app
 ```
 
-These workflows are not implemented yet. The current code is the filesystem
-formatter and metadata foundation they will build on.
+These workflows are still work in progress.

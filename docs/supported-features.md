@@ -76,7 +76,6 @@ external xattr block.
 - The implementation uses 32-bit block addresses and 32-byte group descriptors.
 - Images are deliberately created without a journal.
 - Hard links, sparse files, inline/shared xattrs, SELinux validation, OCI
-  whiteouts, UUID generation, OCI import, and host-directory traversal are not
-  implemented yet.
-- The caller supplies validated `PosixMetadata` values until host/OCI metadata
-  extraction exists.
+  whiteouts, UUID generation, and OCI import are not implemented yet.
+- Host import preserves the portable subset of metadata supported by the host
+  OS. OCI metadata extraction is still to be implemented.
