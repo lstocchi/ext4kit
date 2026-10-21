@@ -1,0 +1,215 @@
+//! Path resolution inside the image, following symlinks like a chrooted
+//! path walk.
+
+use super::Ext4ImageBuilder;
+use crate::ext4::*;
+use anyhow::Result;
+
+/// Linux MAXSYMLINKS: the kernel gives up with ELOOP after 40 links.
+const MAX_SYMLINK_HOPS: usize = 40;
+
+impl Ext4ImageBuilder {
+    /// Returns the target of a symlink inode.
+    pub fn read_symlink(&self, ino: u32) -> Result<String> {
+        let inode = self.inode(ino);
+        if inode.file_type() != S_IFLNK {
+            return Err(anyhow::anyhow!("inode {ino} is not a symlink"));
+        }
+        let size = inode.i_size_lo as usize;
+        let target = if inode.i_flags & EXT4_EXTENTS_FL != 0 {
+            let block = self
+                .get_inode_extents(inode)?
+                .first()
+                .map(|extent| extent.ee_start_lo)
+                .ok_or_else(|| anyhow::anyhow!("symlink inode {ino} has no data block"))?;
+            let offset = block as usize * BLOCK_SIZE;
+            self.disk_data
+                .get(offset..offset + size)
+                .filter(|_| size < BLOCK_SIZE)
+                .ok_or_else(|| anyhow::anyhow!("symlink inode {ino} has an invalid size"))?
+        } else {
+            inode
+                .i_block
+                .get(..size)
+                .ok_or_else(|| anyhow::anyhow!("symlink inode {ino} has an invalid size"))?
+        };
+        String::from_utf8(target.to_vec())
+            .map_err(|_| anyhow::anyhow!("symlink inode {ino} target is not UTF-8"))
+    }
+
+    /// Walks `path` from the directory chain `stack` (root first), following
+    /// every symlink, including a final one.  Returns the resolved chain,
+    /// whose last element is the target inode, or `None` when a component is
+    /// missing or a non-final component is not a directory.
+    fn walk_path(
+        &self,
+        mut stack: Vec<u32>,
+        path: &str,
+        hops: &mut usize,
+    ) -> Result<Option<Vec<u32>>> {
+        if path.starts_with('/') {
+            stack.truncate(1);
+        }
+        for part in path
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+        {
+            let current = *stack.last().expect("the walk always keeps the root");
+            if !self.is_directory(current) {
+                return Ok(None);
+            }
+            if part == ".." {
+                // As in a chroot, ".." at the root stays at the root.
+                if stack.len() > 1 {
+                    stack.pop();
+                }
+                continue;
+            }
+            let Some(child) = self.lookup_dir_entry(current, part)? else {
+                return Ok(None);
+            };
+            if self.inode(child).file_type() != S_IFLNK {
+                stack.push(child);
+                continue;
+            }
+            *hops += 1;
+            if *hops > MAX_SYMLINK_HOPS {
+                return Err(anyhow::anyhow!(
+                    "too many levels of symbolic links resolving {path:?}"
+                ));
+            }
+            let target = self.read_symlink(child)?;
+            match self.walk_path(stack, &target, hops)? {
+                Some(resolved) => stack = resolved,
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(stack))
+    }
+
+    /// Resolves an absolute image path to an existing directory, following
+    /// symlinks (e.g. merged-usr `/lib -> usr/lib`).
+    pub fn resolve_directory(&self, path: &str) -> Result<Option<u32>> {
+        let resolved = self.walk_path(vec![EXT4_ROOT_INO], path, &mut 0)?;
+        Ok(resolved
+            .and_then(|chain| chain.last().copied())
+            .filter(|&inode| self.is_directory(inode)))
+    }
+
+    /// Resolves the parent directories of `path` through symlinks and looks
+    /// up its final component without following it.
+    pub fn resolve_entry(&self, path: &str) -> Result<Option<u32>> {
+        let path = path.trim_end_matches('/');
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+        if name.is_empty() || name == "." || name == ".." {
+            return self.resolve_directory(path);
+        }
+        match self.resolve_directory(parent)? {
+            Some(parent) => self.lookup_dir_entry(parent, name),
+            None => Ok(None),
+        }
+    }
+
+    /// Returns the directory at `path`, creating missing components.  Symlinks
+    /// to directories are followed, as in containerd's layer applier.  Other
+    /// non-directories are replaced by an empty directory when
+    /// `replace_non_directories` is set, and are an error otherwise.
+    pub fn ensure_directory(&mut self, path: &str, replace_non_directories: bool) -> Result<u32> {
+        let mut stack = vec![EXT4_ROOT_INO];
+        for part in path
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+        {
+            if part == ".." {
+                return Err(anyhow::anyhow!("image path {path:?} must not contain '..'"));
+            }
+            let current = *stack.last().expect("the walk always keeps the root");
+            let Some(child) = self.lookup_dir_entry(current, part)? else {
+                stack.push(self.mkdir(current, part, None)?);
+                continue;
+            };
+            if self.inode(child).is_dir() {
+                stack.push(child);
+                continue;
+            }
+            if self.inode(child).file_type() == S_IFLNK {
+                let target = self.read_symlink(child)?;
+                if let Some(resolved) = self.walk_path(stack.clone(), &target, &mut 1)?
+                    && resolved
+                        .last()
+                        .is_some_and(|&inode| self.is_directory(inode))
+                {
+                    stack = resolved;
+                    continue;
+                }
+            }
+            if !replace_non_directories {
+                return Err(anyhow::anyhow!(
+                    "image path component {part:?} of {path:?} is not a directory"
+                ));
+            }
+            self.remove_dir_entry(current, part)?;
+            stack.push(self.mkdir(current, part, None)?);
+        }
+        Ok(*stack.last().expect("the walk always keeps the root"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::PosixMetadata;
+
+    fn builder() -> Result<Ext4ImageBuilder> {
+        let mut builder = Ext4ImageBuilder::new(16);
+        builder.create_root_dir()?;
+        builder.reserve_inodes();
+        Ok(builder)
+    }
+
+    #[test]
+    fn ensure_directory_follows_merged_usr_symlinks() -> Result<()> {
+        let mut builder = builder()?;
+        let usr = builder.mkdir(EXT4_ROOT_INO, "usr", None)?;
+        let usr_lib = builder.mkdir(usr, "lib", None)?;
+        builder.add_symlink(EXT4_ROOT_INO, "lib", "usr/lib", &PosixMetadata::default())?;
+
+        let modules = builder.ensure_directory("/lib/modules", false)?;
+        assert_eq!(builder.lookup_dir_entry(usr_lib, "modules")?, Some(modules));
+        assert_eq!(builder.resolve_directory("/lib/modules")?, Some(modules));
+        assert_eq!(builder.resolve_directory("/lib/modules/../..")?, Some(usr));
+        assert!(builder.lookup_dir_entry(EXT4_ROOT_INO, "lib")?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn slow_symlinks_resolve_and_loops_are_rejected() -> Result<()> {
+        let mut builder = builder()?;
+        let target = format!("/{}", "d/".repeat(40));
+        let mut dir = EXT4_ROOT_INO;
+        for _ in 0..40 {
+            dir = builder.mkdir(dir, "d", None)?;
+        }
+        builder.add_symlink(EXT4_ROOT_INO, "deep", &target, &PosixMetadata::default())?;
+        assert_eq!(
+            builder.read_symlink(builder.lookup_dir_entry(EXT4_ROOT_INO, "deep")?.unwrap())?,
+            target
+        );
+        assert_eq!(builder.resolve_directory("/deep")?, Some(dir));
+
+        builder.add_symlink(EXT4_ROOT_INO, "loop", "loop", &PosixMetadata::default())?;
+        assert!(builder.resolve_directory("/loop").is_err());
+        assert!(builder.ensure_directory("/loop/x", false).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn ensure_directory_replaces_files_only_when_asked() -> Result<()> {
+        let mut builder = builder()?;
+        builder.add_file(EXT4_ROOT_INO, "etc", b"file", &PosixMetadata::default())?;
+        assert!(builder.ensure_directory("/etc/app", false).is_err());
+        let app = builder.ensure_directory("/etc/app", true)?;
+        assert_eq!(builder.resolve_directory("/etc/app")?, Some(app));
+        Ok(())
+    }
+}

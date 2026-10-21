@@ -82,9 +82,9 @@ impl Ext4ImageBuilder {
                 .checked_mul(1024 * 1024 / BLOCK_SIZE)
                 .ok_or_else(|| anyhow::anyhow!("image size overflow"))?;
             let groups = image_blocks.div_ceil(BLOCKS_PER_GROUP);
-            let inodes_per_group = (image_blocks / groups / 8) * 8;
+            let inodes_per_group = Self::inodes_per_group(image_blocks, groups);
             let inode_table_blocks = groups
-                .checked_mul(inodes_per_group * INODE_SIZE / BLOCK_SIZE)
+                .checked_mul((inodes_per_group * INODE_SIZE).div_ceil(BLOCK_SIZE))
                 .ok_or_else(|| anyhow::anyhow!("inode table size overflow"))?;
             // One block bitmap and one inode bitmap per group, plus primary
             // and sparse-super backup metadata. This is conservative.
@@ -152,6 +152,47 @@ impl Ext4ImageBuilder {
         source: impl AsRef<Path>,
     ) -> Result<u32> {
         self.import_host_path_streaming_impl(parent, source.as_ref())
+    }
+
+    /// Merges a host directory into an existing ext4 directory.  Host entries
+    /// replace like-named non-directories; like-named directories are merged.
+    /// The existing directory keeps its own metadata (mode, owner, xattrs),
+    /// as when copying into a directory that already exists.
+    pub fn overlay_host_directory(&mut self, parent: u32, source: impl AsRef<Path>) -> Result<()> {
+        let source = source.as_ref();
+        let metadata = fs::symlink_metadata(source)
+            .with_context(|| format!("cannot inspect host directory {}", source.display()))?;
+        if !metadata.file_type().is_dir() {
+            return Err(anyhow::anyhow!(
+                "host overlay source is not a directory: {}",
+                source.display()
+            ));
+        }
+        self.merge_host_directory(parent, source)
+    }
+
+    fn merge_host_directory(&mut self, parent: u32, source: &Path) -> Result<()> {
+        for path in Self::sorted_host_entries(source)? {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("host path name is not valid UTF-8: {}", path.display())
+                })?;
+            if let Some(existing) = self.lookup_dir_entry(parent, name)? {
+                let host_is_dir = fs::symlink_metadata(&path)
+                    .with_context(|| format!("cannot inspect host path {}", path.display()))?
+                    .file_type()
+                    .is_dir();
+                if host_is_dir && self.is_directory(existing) {
+                    self.merge_host_directory(existing, &path)?;
+                    continue;
+                }
+                self.remove_dir_entry(parent, name)?;
+            }
+            self.import_host_path_impl(parent, &path)?;
+        }
+        Ok(())
     }
 
     fn import_host_path_streaming_impl(&mut self, parent: u32, source: &Path) -> Result<u32> {
@@ -348,17 +389,21 @@ impl Ext4ImageBuilder {
         Ok(parent)
     }
 
-    /// Imports sorted children of a host directory below an existing inode.
-    fn import_host_directory_contents(&mut self, parent: u32, source: &Path) -> Result<()> {
+    /// Returns a host directory's children in a stable order, which keeps
+    /// generated images reproducible for an unchanged tree.
+    fn sorted_host_entries(source: &Path) -> Result<Vec<PathBuf>> {
         let mut entries: Vec<PathBuf> = fs::read_dir(source)
             .with_context(|| format!("cannot read host directory {}", source.display()))?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<std::io::Result<_>>()
             .with_context(|| format!("cannot enumerate host directory {}", source.display()))?;
-        // A stable order makes generated images reproducible for an unchanged tree.
         entries.sort();
+        Ok(entries)
+    }
 
-        for path in entries {
+    /// Imports sorted children of a host directory below an existing inode.
+    fn import_host_directory_contents(&mut self, parent: u32, source: &Path) -> Result<()> {
+        for path in Self::sorted_host_entries(source)? {
             self.import_host_path_impl(parent, &path)?;
         }
         Ok(())
@@ -378,7 +423,7 @@ impl Ext4ImageBuilder {
                 .map_or(0, |value| value.as_secs().min(u32::MAX as u64) as u32)
         };
         PosixMetadata {
-            mode,
+            mode: Some(mode),
             atime: timestamp(metadata.accessed()),
             ctime: timestamp(metadata.created()),
             mtime: timestamp(metadata.modified()),
@@ -465,7 +510,7 @@ impl HostMetadata {
 
     fn as_posix(self) -> PosixMetadata {
         PosixMetadata {
-            mode: self.mode,
+            mode: Some(self.mode),
             uid: self.uid,
             gid: self.gid,
             atime: self.atime,
@@ -682,6 +727,59 @@ mod tests {
             builder.groups[group].inode_table[index].i_mode & 0xf000,
             crate::ext4::S_IFDIR
         );
+
+        fs::remove_dir_all(base)?;
+        Ok(())
+    }
+
+    #[test]
+    fn overlay_replacing_a_nested_directory_releases_links_and_caches() -> Result<()> {
+        let base =
+            std::env::temp_dir().join(format!("ext4kit-overlay-remove-{}", std::process::id()));
+        let incoming = base.join("incoming");
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&incoming)?;
+        fs::write(incoming.join("replacement"), b"new file")?;
+
+        let mut builder = Ext4ImageBuilder::new(16);
+        builder.create_root_dir()?;
+        builder.create_lost_and_found()?;
+        builder.reserve_inodes();
+
+        let overlay = builder.mkdir(EXT4_ROOT_INO, "overlay", None)?;
+        let replacement_dir = builder.mkdir(overlay, "replacement", None)?;
+        let nested_dir = builder.mkdir(replacement_dir, "nested", None)?;
+        builder.add_file(
+            nested_dir,
+            "old.txt",
+            b"old file",
+            &PosixMetadata::default(),
+        )?;
+        builder
+            .directory_caches
+            .insert(replacement_dir, Default::default());
+        builder
+            .directory_caches
+            .insert(nested_dir, Default::default());
+
+        let free_inodes = builder.superblock.s_free_inodes_count;
+        builder.overlay_host_directory(overlay, &incoming)?;
+
+        let replacement = builder
+            .lookup_dir_entry(overlay, "replacement")?
+            .expect("overlay should import the replacement file");
+        assert_eq!(builder.inode(replacement).file_type(), crate::ext4::S_IFREG);
+        assert_eq!({ builder.inode(EXT4_ROOT_INO).i_links_count }, 4);
+        assert_eq!({ builder.inode(overlay).i_links_count }, 2);
+        assert_eq!({ builder.group_descriptors[0].bg_used_dirs_count_lo }, 3);
+        // Two directories and one file were released; the replacement file
+        // may reuse one of their inode numbers.
+        assert_eq!(
+            { builder.superblock.s_free_inodes_count },
+            free_inodes + 3 - 1
+        );
+        assert!(!builder.directory_caches.contains_key(&replacement_dir));
+        assert!(!builder.directory_caches.contains_key(&nested_dir));
 
         fs::remove_dir_all(base)?;
         Ok(())

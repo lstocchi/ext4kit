@@ -205,9 +205,8 @@ impl Ext4ImageBuilder {
         if !self.is_inode_allocated(ino) {
             return Err(anyhow::anyhow!("inode {ino} does not exist"));
         }
-        let (group, index) = self.inode_location(ino);
-        let inode = &self.groups[group].inode_table[index];
-        if inode.i_mode & S_IFDIR != S_IFDIR {
+        let inode = self.inode(ino);
+        if !inode.is_dir() {
             return Err(anyhow::anyhow!("inode {ino} is not a directory"));
         }
         Ok(inode.i_flags & EXT4_INDEX_FL != 0)
@@ -245,34 +244,17 @@ impl Ext4ImageBuilder {
 
     /// Reads active entries from one ordinary directory leaf.
     pub(crate) fn read_dir_leaf(&self, block: u32) -> Result<Vec<HtreeEntry>> {
-        let base = block as usize * BLOCK_SIZE;
         let mut entries = Vec::new();
-        let mut off = 0;
-        while off < BLOCK_SIZE {
-            let e =
-                Ext4DirEntry2Header::read_from_bytes(&self.disk_data[base + off..base + off + 8])
-                    .map_err(|_| anyhow::anyhow!("invalid directory entry header"))?;
-            let len = e.rec_len as usize;
-            if len < 8
-                || len % 4 != 0
-                || off + len > BLOCK_SIZE
-                || (e.inode != 0 && e.name_len as usize + 8 > len)
-            {
-                return Err(anyhow::anyhow!(
-                    "directory block {block} has an invalid record"
-                ));
-            }
-            if e.inode != 0 {
-                let name =
-                    self.disk_data[base + off + 8..base + off + 8 + e.name_len as usize].to_vec();
+        for record in self.dir_block_records(block)? {
+            if record.inode != 0 {
+                let name = self.record_name(&record).to_vec();
                 entries.push(HtreeEntry {
                     hash: self.dir_hash(&name),
-                    inode: e.inode,
-                    file_type: e.file_type,
+                    inode: record.inode,
+                    file_type: record.file_type,
                     name,
                 });
             }
-            off += len;
         }
         Ok(entries)
     }
@@ -499,66 +481,27 @@ impl Ext4ImageBuilder {
         Ok(())
     }
 
-    /// Looks up only the htree-selected leaf, rather than linearly walking the directory.
-    pub(crate) fn find_htree_slot(&self, parent: u32, name: &str) -> Result<Option<DirSlot>> {
-        let hash = self.dir_hash(name.as_bytes());
+    /// Returns the physical leaf blocks that may hold `hash`: the dx-selected
+    /// leaf followed by continuation leaves whose boundary carries the
+    /// collision bit, as in ext4 htree_dirblock_to_tree()/dx_probe().
+    pub(crate) fn htree_candidate_blocks(&self, parent: u32, hash: u32) -> Result<Vec<u32>> {
         let (levels, root) = self.read_dx_root(parent)?;
-        let root_pos = dx_position(&root, hash)?;
         let blocks = self.get_dir_blocks(parent)?;
-        let needed = align4(8 + name.len());
-        let mut found = None;
-        let mut node_pos = root_pos;
+        let mut node_pos = dx_position(&root, hash)?;
         let mut index = if levels == 0 {
             root.clone()
         } else {
             self.read_dx_node(parent, root[node_pos].1)?
         };
         let mut leaf_pos = dx_position(&index, hash)?;
-        'collision_chain: loop {
+        let mut candidates = Vec::new();
+        loop {
             let logical = index[leaf_pos].1;
-            let block = *blocks
-                .get(logical as usize)
-                .ok_or_else(|| anyhow::anyhow!("dx entry points outside directory"))?;
-            let base = block as usize * BLOCK_SIZE;
-            let mut off = 0;
-            while off < BLOCK_SIZE {
-                let e = Ext4DirEntry2Header::read_from_bytes(
-                    &self.disk_data[base + off..base + off + 8],
-                )
-                .map_err(|_| anyhow::anyhow!("invalid directory entry header"))?;
-                let len = e.rec_len as usize;
-                if len < 8
-                    || len % 4 != 0
-                    || off + len > BLOCK_SIZE
-                    || (e.inode != 0 && e.name_len as usize + 8 > len)
-                {
-                    return Err(anyhow::anyhow!(
-                        "directory inode {parent} has an invalid record"
-                    ));
-                }
-                if e.inode != 0 {
-                    if e.name_len as usize == name.len()
-                        && &self.disk_data[base + off + 8..base + off + 8 + e.name_len as usize]
-                            == name.as_bytes()
-                    {
-                        return Err(anyhow::anyhow!("directory entry {name:?} already exists"));
-                    }
-                    let actual = align4(8 + e.name_len as usize);
-                    if found.is_none() && len >= actual + needed {
-                        found = Some(DirSlot::SplitActiveRecord {
-                            offset: base + off,
-                            actual,
-                            rec_len: len,
-                        });
-                    }
-                } else if found.is_none() && len >= needed {
-                    found = Some(DirSlot::EmptyRecord {
-                        offset: base + off,
-                        rec_len: len,
-                    });
-                }
-                off += len;
-            }
+            candidates.push(
+                *blocks
+                    .get(logical as usize)
+                    .ok_or_else(|| anyhow::anyhow!("dx entry points outside directory"))?,
+            );
             leaf_pos += 1;
             if leaf_pos < index.len() {
                 if index[leaf_pos].0 & 1 != 0 && index[leaf_pos].0 & !1 == hash {
@@ -572,10 +515,40 @@ impl Ext4ImageBuilder {
                     node_pos += 1;
                     index = self.read_dx_node(parent, root[node_pos].1)?;
                     leaf_pos = 0;
-                    continue 'collision_chain;
+                    continue;
                 }
             }
             break;
+        }
+        Ok(candidates)
+    }
+
+    /// Looks up only the htree-selected leaf, rather than linearly walking the directory.
+    pub(crate) fn find_htree_slot(&self, parent: u32, name: &str) -> Result<Option<DirSlot>> {
+        let hash = self.dir_hash(name.as_bytes());
+        let needed = align4(8 + name.len());
+        let mut found = None;
+        for block in self.htree_candidate_blocks(parent, hash)? {
+            for record in self.dir_block_records(block)? {
+                if record.inode != 0 {
+                    if self.record_name(&record) == name.as_bytes() {
+                        return Err(anyhow::anyhow!("directory entry {name:?} already exists"));
+                    }
+                    let actual = align4(8 + record.name_len);
+                    if found.is_none() && record.rec_len >= actual + needed {
+                        found = Some(DirSlot::SplitActiveRecord {
+                            offset: record.offset,
+                            actual,
+                            rec_len: record.rec_len,
+                        });
+                    }
+                } else if found.is_none() && record.rec_len >= needed {
+                    found = Some(DirSlot::EmptyRecord {
+                        offset: record.offset,
+                        rec_len: record.rec_len,
+                    });
+                }
+            }
         }
         Ok(found)
     }

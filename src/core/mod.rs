@@ -19,6 +19,7 @@ mod extent;
 mod file;
 mod host;
 mod htree;
+mod path;
 mod special;
 mod symlink;
 pub use directory::PosixMetadata;
@@ -112,18 +113,7 @@ impl Ext4ImageBuilder {
 
         let block_groups_number = blocks_number.div_ceil(BLOCKS_PER_GROUP);
 
-        let target_inodes = image_size_bytes / BYTES_PER_INODE_RATIO;
-        let mut inodes_per_group = target_inodes / block_groups_number;
-
-        // Align inodes_per_group to a multiple of 8
-        if inodes_per_group % 8 != 0 {
-            inodes_per_group -= inodes_per_group % 8;
-        }
-
-        // Ensure minimum ext4 inode limit per group
-        if inodes_per_group < 16 {
-            inodes_per_group = 16;
-        }
+        let inodes_per_group = Self::inodes_per_group(blocks_number, block_groups_number);
 
         // Re-calculate actual total inodes based on rounded group count
         let total_inodes = inodes_per_group * block_groups_number;
@@ -203,6 +193,22 @@ impl Ext4ImageBuilder {
         builder
     }
 
+    /// Inodes per group for an image of `blocks` blocks in `groups` groups.
+    /// Like ext2fs_initialize(), the count is rounded up so the inode table
+    /// fills its last block completely ("waste not, want not"), then kept a
+    /// multiple of 8 for the inode bitmap.
+    pub(crate) fn inodes_per_group(blocks: usize, groups: usize) -> usize {
+        let target = blocks * BLOCK_SIZE / BYTES_PER_INODE_RATIO / groups;
+        let inodes_per_block = BLOCK_SIZE / INODE_SIZE;
+        let table_blocks = (target.max(16) * INODE_SIZE).div_ceil(BLOCK_SIZE);
+        (table_blocks * inodes_per_block).min(BLOCKS_PER_GROUP) & !7
+    }
+
+    /// Number of blocks occupied by each group's inode table.
+    pub(crate) fn inode_table_blocks(&self) -> usize {
+        (self.superblock.s_inodes_per_group as usize * INODE_SIZE).div_ceil(BLOCK_SIZE)
+    }
+
     /// Marks one physical block allocated and updates accounting; returns no value.
     fn mark_block_used(&mut self, group_idx: usize, block: u32) {
         let byte_idx = (block / 8) as usize;
@@ -273,7 +279,7 @@ impl Ext4ImageBuilder {
         let gdt_blocks = gdt_bytes.div_ceil(BLOCK_SIZE);
 
         let inodes_per_group = self.superblock.s_inodes_per_group as usize;
-        let itable_blocks = (inodes_per_group * INODE_SIZE) / BLOCK_SIZE;
+        let itable_blocks = self.inode_table_blocks();
 
         for group_idx in 0..block_groups_number {
             // Absolute block offset where this group starts on disk
@@ -437,25 +443,41 @@ impl Ext4ImageBuilder {
         ))
     }
 
-    /// Releases an allocated block, updates accounting, and rewinds the group
-    /// allocation cursor when the released block precedes it.
-    pub(crate) fn release_block(&mut self, block: u32) -> Result<()> {
-        let group = (block as usize) / BLOCKS_PER_GROUP;
-        let local = (block as usize) % BLOCKS_PER_GROUP;
-        if group >= self.groups.len() || local >= self.groups[group].blocks_count as usize {
-            return Err(anyhow::anyhow!("block {block} is outside the filesystem"));
+    /// Verifies that every block in `[start, start + len)` lies inside the
+    /// filesystem and is marked allocated.
+    pub(crate) fn validate_allocated_run(&self, start: u32, len: u32) -> Result<()> {
+        for block in u64::from(start)..u64::from(start) + u64::from(len) {
+            let group = block as usize / BLOCKS_PER_GROUP;
+            let local = block as usize % BLOCKS_PER_GROUP;
+            if group >= self.groups.len() || local >= self.groups[group].blocks_count as usize {
+                return Err(anyhow::anyhow!("block {block} is outside the filesystem"));
+            }
+            if self.groups[group].block_bitmap[local / 8] & (1 << (local % 8)) == 0 {
+                return Err(anyhow::anyhow!("block {block} is not allocated"));
+            }
         }
-        let byte = local / 8;
-        let bit = local % 8;
-        if self.groups[group].block_bitmap[byte] & (1 << bit) == 0 {
-            return Err(anyhow::anyhow!("block {block} is not allocated"));
-        }
-        self.groups[group].block_bitmap[byte] &= !(1 << bit);
-        self.groups[group].free_blocks_count += 1;
-        self.group_descriptors[group].bg_free_blocks_count_lo += 1;
-        self.superblock.s_free_blocks_count_lo += 1;
-        self.next_block_hints[group] = self.next_block_hints[group].min(local);
         Ok(())
+    }
+
+    /// Releases a run of allocated blocks (ext2fs_block_alloc_stats_range),
+    /// updating accounting and rewinding each group's allocation cursor.
+    pub(crate) fn release_blocks(&mut self, start: u32, len: u32) -> Result<()> {
+        self.validate_allocated_run(start, len)?;
+        for block in start..start + len {
+            let group = block as usize / BLOCKS_PER_GROUP;
+            let local = block as usize % BLOCKS_PER_GROUP;
+            self.groups[group].block_bitmap[local / 8] &= !(1 << (local % 8));
+            self.groups[group].free_blocks_count += 1;
+            self.group_descriptors[group].bg_free_blocks_count_lo += 1;
+            self.superblock.s_free_blocks_count_lo += 1;
+            self.next_block_hints[group] = self.next_block_hints[group].min(local);
+        }
+        Ok(())
+    }
+
+    /// Releases one allocated block.
+    pub(crate) fn release_block(&mut self, block: u32) -> Result<()> {
+        self.release_blocks(block, 1)
     }
 
     /// Prove that a file extent plus any separately allocated metadata block
@@ -870,6 +892,7 @@ fn find_next_free_bit(bitmap: &[u8], start: usize, end: usize) -> Option<usize> 
 #[cfg(test)]
 mod bitmap_tests {
     use super::{DiskData, Ext4ImageBuilder, find_next_free_bit};
+    use crate::ext4::{BLOCK_SIZE, INODE_SIZE};
 
     #[test]
     fn free_bit_search_respects_range_and_bit_order() {
@@ -900,5 +923,19 @@ mod bitmap_tests {
         assert_eq!(std::fs::metadata(&path)?.len(), 16 * 1024 * 1024);
         std::fs::remove_file(path)?;
         Ok(())
+    }
+
+    #[test]
+    fn inode_table_fills_whole_blocks_like_ext2fs_initialize() {
+        // 524 MiB has 134,144 blocks in 5 groups: a target of 26,828 inodes
+        // per group, which previously left the last inode-table block half used.
+        for size_mb in [16, 100, 524, 1000] {
+            let builder = Ext4ImageBuilder::new(size_mb);
+            let per_group = builder.superblock.s_inodes_per_group as usize;
+            assert_eq!(per_group * INODE_SIZE % BLOCK_SIZE, 0, "{size_mb} MiB");
+            assert_eq!(per_group % 8, 0);
+            let total = builder.superblock.s_inodes_count as usize;
+            assert_eq!(total, per_group * builder.groups.len());
+        }
     }
 }

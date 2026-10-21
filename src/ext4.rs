@@ -56,6 +56,10 @@ pub const S_IFBLK: u16 = 0x6000; // Block device
 pub const S_IFREG: u16 = 0x8000; // Regular file
 pub const S_IFLNK: u16 = 0xA000; // Symbolic link
 pub const S_IFSOCK: u16 = 0xC000; // Socket
+pub const S_IFMT: u16 = 0xF000; // File type mask
+
+/// Maximum link count of a non-directory inode (EXT4_LINK_MAX / EXT2_LINK_MAX).
+pub const EXT4_LINK_MAX: u16 = 65000;
 
 // Feature Flags
 pub const EXT4_BG_INODE_ZEROED: u16 = 0x0004;
@@ -63,6 +67,7 @@ pub const EXT4_FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
 pub const EXT4_FEATURE_INCOMPAT_EXTENTS: u32 = 0x0040;
 pub const EXT4_FEATURE_COMPAT_EXT_ATTR: u32 = 0x0008;
 pub const EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
+pub const EXT4_FEATURE_RO_COMPAT_DIR_NLINK: u32 = 0x0020;
 /// Metadata checksum features are intentionally unsupported: corresponding
 /// superblock feature flags stay clear and checksum fields remain zero.
 pub const EXT4_FEATURE_RO_COMPAT_GDT_CSUM: u32 = 0x0010;
@@ -162,7 +167,10 @@ impl Default for Ext4SuperBlock {
             // The allocator below places backups only in sparse-super groups.
             // Keep GDT_CSUM and METADATA_CSUM clear: this writer does not
             // calculate group-descriptor, bitmap, or extent-block checksums.
-            s_feature_ro_compat: EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER,
+            // dir_nlink matches mke2fs's ext4 defaults and lets directories
+            // with more than EXT4_LINK_MAX subdirectories keep a link count of 1.
+            s_feature_ro_compat: EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER
+                | EXT4_FEATURE_RO_COMPAT_DIR_NLINK,
             s_uuid: [0; 16],
             s_volume_name: [0; 16],
             s_last_mounted: [0; 64],
@@ -267,6 +275,19 @@ impl Default for Ext4Inode {
             i_projid: 0,
             _padding: [0; 96],
         }
+    }
+}
+
+impl Ext4Inode {
+    /// Returns the `S_IF*` file-type bits of `i_mode`.
+    pub fn file_type(&self) -> u16 {
+        self.i_mode & S_IFMT
+    }
+
+    /// Returns whether the inode is a directory.  Comparing the full type
+    /// field matters: block devices and sockets also carry the S_IFDIR bit.
+    pub fn is_dir(&self) -> bool {
+        self.file_type() == S_IFDIR
     }
 }
 
