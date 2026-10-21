@@ -5,6 +5,7 @@
 
 pub mod core;
 pub mod ext4;
+pub mod oci;
 pub mod xattr;
 
 pub use core::{Ext4ImageBuilder, directory};

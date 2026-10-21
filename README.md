@@ -6,7 +6,7 @@ It is intended to make application files available to Linux VMs through ext4 dis
 
 ## Status
 
-The formatter supports files, directories, symlinks, special nodes, extents, POSIX metadata, xattrs, POSIX ACLs, and host-directory traversal. OCI import and a complete CLI are planned.
+The formatter supports files, directories, symlinks, special nodes, extents, POSIX metadata, xattrs, POSIX ACLs, host-directory traversal, and streaming OCI image import.
 
 ## Quick start
 
@@ -34,6 +34,30 @@ Repeat `--add` to compose an image from several sources:
 
 ```powershell
 cargo run -- create --add C:\work\hosts:/etc --add C:\work\app:/opt output.img
+```
+
+Use an image as the base filesystem with `--from`. An unqualified reference is
+first looked up in a local Podman or Docker engine, then falls back to its OCI
+registry when absent (only linux/amd64 images and anonymous registry access are
+supported). Prefix a remote reference with `docker://` to skip the local
+lookup. Layers are downloaded, digest-verified and extracted without touching
+the host filesystem; later `--add` arguments can replace or augment paths from
+the base image, merging into existing directories. The filesystem is sized
+automatically from the image manifest (or the local engine's uncompressed image
+size); an explicit `--size` overrides that estimate:
+
+```powershell
+cargo run -- create --from docker.io/library/alpine:latest `
+  --add C:\work\app:/opt output.img
+```
+
+To require a local Docker or Podman image, use the `docker-daemon:` or
+`containers-storage:` transport respectively. Local resolution honours
+`DOCKER_HOST` / `CONTAINER_HOST` and otherwise tries the default Unix sockets
+or Windows named pipes:
+
+```powershell
+cargo run -- create --from docker-daemon:alpine:latest output.img
 ```
 
 In library code, initialize the root directory and then call
