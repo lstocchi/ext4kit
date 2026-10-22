@@ -2,7 +2,9 @@
 
 `ext4kit` is organized around a `core` boundary.
 
-* `core/` owns filesystem-image construction, allocation, inode operations, directory records, extent trees, host import, and node creation.
+* `core/` owns filesystem-image construction, allocation, inode operations, directory records, extent trees, and node creation.
+* `host/` imports host files, directories, and symlinks (`tree.rs` holds the pre-scanned `HostTree` arena used for sizing).
+* `oci/` streams OCI image layers from a registry or a local container engine.
 * `ext4.rs` holds the on-disk wire structures and constants.
 * `xattr.rs` handles inode metadata shared by files, directories, links, and special nodes.
 
@@ -24,4 +26,4 @@ When the caller supplies the image size, the sizing arena is unnecessary.
 map from live directory IDs to ext4 inode numbers. The CLI selects this path
 with `create --size MIB`.
 
-OCI import and an agent harness will become sibling components to `core` when concrete functionality exists.
+An agent harness will become a sibling component to `core` when concrete functionality exists.

@@ -5,69 +5,96 @@ use crate::ext4::*;
 use anyhow::Result;
 use zerocopy::FromBytes;
 
+/// Maximum extent tree depth accepted by e2fsprogs and the kernel.
+const EXT4_MAX_EXTENT_DEPTH: u16 = 5;
+
+/// Initialized extents are at most 32,768 blocks long; larger `ee_len`
+/// values encode an uninitialized extent of `ee_len - 32768` blocks.
+const EXT_INIT_MAX_LEN: u16 = 1 << 15;
+
+/// Leaf extents and external index/leaf blocks reachable from an inode.
+#[derive(Default)]
+pub(crate) struct ExtentTree {
+    pub(crate) leaves: Vec<Ext4Extent>,
+    pub(crate) tree_blocks: Vec<u32>,
+}
+
+/// Returns the number of blocks mapped by `extent`, initialized or not.
+pub(crate) fn extent_len(extent: &Ext4Extent) -> u32 {
+    let len = extent.ee_len;
+    u32::from(if len > EXT_INIT_MAX_LEN {
+        len - EXT_INIT_MAX_LEN
+    } else {
+        len
+    })
+}
+
+/// Mirrors ext2fs_extent_header_verify(): validates magic, entry count and
+/// `eh_max` against the node size (allowing room for a checksum tail).
+fn verify_extent_header(node: &[u8]) -> Result<Ext4ExtentHeader> {
+    let header = node
+        .get(..12)
+        .and_then(|bytes| Ext4ExtentHeader::read_from_bytes(bytes).ok())
+        .ok_or_else(|| anyhow::anyhow!("truncated extent header"))?;
+    if header.eh_magic != EXT4_EH_MAGIC {
+        return Err(anyhow::anyhow!("invalid extent magic"));
+    }
+    let (entries, max) = (header.eh_entries as usize, header.eh_max as usize);
+    let capacity = (node.len() - 12) / 12;
+    if entries > max || max > capacity || max + 2 < capacity {
+        return Err(anyhow::anyhow!("invalid extent header entry count"));
+    }
+    Ok(header)
+}
+
 impl Ext4ImageBuilder {
-    /// Recursively appends leaf extents reachable from `block_data`; returns an error for malformed extent data.
-    fn collect_leaf_extents(&self, block_data: &[u8], extents: &mut Vec<Ext4Extent>) -> Result<()> {
-        let header = Ext4ExtentHeader::read_from_bytes(&block_data[..12])
-            .map_err(|_| anyhow::anyhow!("invalid extent header"))?;
-        if header.eh_magic != EXT4_EH_MAGIC {
-            return Err(anyhow::anyhow!("invalid extent magic"));
+    /// Walks an extent tree node, requiring each child to be exactly one
+    /// level below its parent.  Strictly decreasing depth bounds the walk, so
+    /// a corrupt tree cannot cycle.
+    fn walk_extent_node(
+        &self,
+        node: &[u8],
+        expected_depth: Option<u16>,
+        tree: &mut ExtentTree,
+    ) -> Result<()> {
+        let header = verify_extent_header(node)?;
+        let depth = header.eh_depth;
+        if depth > EXT4_MAX_EXTENT_DEPTH || expected_depth.is_some_and(|d| d != depth) {
+            return Err(anyhow::anyhow!("invalid extent tree depth {depth}"));
         }
-        let entries = header.eh_entries as usize;
-        if header.eh_depth == 0 {
-            for i in 0..entries {
-                let off = 12 + i * 12;
-                let ext = Ext4Extent::read_from_bytes(&block_data[off..off + 12])
-                    .map_err(|_| anyhow::anyhow!("invalid extent record"))?;
-                extents.push(ext);
+        for i in 0..header.eh_entries as usize {
+            let entry = &node[12 + i * 12..24 + i * 12];
+            if depth == 0 {
+                tree.leaves.push(
+                    Ext4Extent::read_from_bytes(entry)
+                        .map_err(|_| anyhow::anyhow!("invalid extent entry"))?,
+                );
+                continue;
             }
-        } else {
-            for i in 0..entries {
-                let off = 12 + i * 12;
-                let idx = Ext4ExtentIdx::read_from_bytes(&block_data[off..off + 12])
-                    .map_err(|_| anyhow::anyhow!("invalid extent index"))?;
-                let blk = idx.ei_leaf_lo as usize;
-                let offset = blk * BLOCK_SIZE;
-                self.collect_leaf_extents(&self.disk_data[offset..offset + BLOCK_SIZE], extents)?;
-            }
+            let idx = Ext4ExtentIdx::read_from_bytes(entry)
+                .map_err(|_| anyhow::anyhow!("invalid extent index"))?;
+            let block = idx.ei_leaf_lo;
+            let offset = block as usize * BLOCK_SIZE;
+            let child = self
+                .disk_data
+                .get(offset..offset + BLOCK_SIZE)
+                .ok_or_else(|| anyhow::anyhow!("extent block {block} is outside the image"))?;
+            tree.tree_blocks.push(block);
+            self.walk_extent_node(child, Some(depth - 1), tree)?;
         }
         Ok(())
     }
 
-    /// Collects external extent-tree block numbers reachable from a root; returns an error for malformed data.
-    pub(crate) fn collect_extent_tree_blocks(
-        &self,
-        block_data: &[u8],
-        blocks: &mut Vec<u32>,
-    ) -> Result<()> {
-        let header = Ext4ExtentHeader::read_from_bytes(&block_data[..12])
-            .map_err(|_| anyhow::anyhow!("invalid extent header"))?;
-        if header.eh_magic != EXT4_EH_MAGIC {
-            return Err(anyhow::anyhow!("invalid extent magic"));
-        }
-        if header.eh_depth == 0 {
-            return Ok(());
-        }
-        for i in 0..header.eh_entries as usize {
-            let off = 12 + i * 12;
-            let idx = Ext4ExtentIdx::read_from_bytes(&block_data[off..off + 12])
-                .map_err(|_| anyhow::anyhow!("invalid extent index"))?;
-            let block = idx.ei_leaf_lo;
-            blocks.push(block);
-            let data_offset = block as usize * BLOCK_SIZE;
-            self.collect_extent_tree_blocks(
-                &self.disk_data[data_offset..data_offset + BLOCK_SIZE],
-                blocks,
-            )?;
-        }
-        Ok(())
+    /// Decodes the complete extent tree rooted in `inode.i_block`.
+    pub(crate) fn read_extent_tree(&self, inode: &Ext4Inode) -> Result<ExtentTree> {
+        let mut tree = ExtentTree::default();
+        self.walk_extent_node(&inode.i_block, None, &mut tree)?;
+        Ok(tree)
     }
 
     /// Decodes every leaf extent referenced by `inode`; returns them in tree traversal order.
     pub(crate) fn get_inode_extents(&self, inode: &Ext4Inode) -> Result<Vec<Ext4Extent>> {
-        let mut extents = Vec::new();
-        self.collect_leaf_extents(&inode.i_block, &mut extents)?;
-        Ok(extents)
+        Ok(self.read_extent_tree(inode)?.leaves)
     }
 
     /// Returns a directory's physical data blocks in logical order, or an error if it is invalid.
@@ -78,9 +105,8 @@ impl Ext4ImageBuilder {
         if !self.is_inode_allocated(ino) {
             return Err(anyhow::anyhow!("inode {ino} does not exist"));
         }
-        let (g, i) = self.inode_location(ino);
-        let inode = &self.groups[g].inode_table[i];
-        if inode.i_mode & S_IFDIR != S_IFDIR {
+        let inode = self.inode(ino);
+        if !inode.is_dir() {
             return Err(anyhow::anyhow!("inode {ino} is not a directory"));
         }
         if inode.i_flags & EXT4_EXTENTS_FL == 0 {
@@ -91,9 +117,7 @@ impl Ext4ImageBuilder {
         let extents = self.get_inode_extents(inode)?;
         let mut blocks = Vec::new();
         for ext in extents {
-            for b in 0..ext.ee_len {
-                blocks.push(ext.ee_start_lo + b as u32);
-            }
+            blocks.extend((0..extent_len(&ext)).map(|b| ext.ee_start_lo + b));
         }
         Ok(blocks)
     }

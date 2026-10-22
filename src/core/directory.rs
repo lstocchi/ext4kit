@@ -1,4 +1,5 @@
 use super::Ext4ImageBuilder;
+use super::extent::{ExtentTree, extent_len};
 use crate::ext4::*;
 pub use crate::xattr::parse_xattr_name;
 #[cfg(test)]
@@ -11,7 +12,9 @@ use zerocopy::{FromBytes, IntoBytes};
 /// Metadata collected from an OCI layer or a host filesystem.
 #[derive(Clone, Debug, Default)]
 pub struct PosixMetadata {
-    pub mode: u16,
+    /// Permission bits from the source; `None` selects the inode-type
+    /// default.  `Some(0)` is valid POSIX metadata and is kept as is.
+    pub mode: Option<u16>,
     pub uid: u32,
     pub gid: u32,
     pub atime: u32,
@@ -50,7 +53,397 @@ pub(crate) struct DirectoryCache {
     next_append_slot: Option<DirSlot>,
 }
 
+/// One directory record validated by [`Ext4ImageBuilder::dir_block_records`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DirRecord {
+    /// Absolute byte offset of the record in the image.
+    pub(crate) offset: usize,
+    pub(crate) inode: u32,
+    pub(crate) rec_len: usize,
+    pub(crate) name_len: usize,
+    pub(crate) file_type: u8,
+}
+
+/// Inodes and blocks released by a recursive removal, validated up front so
+/// that committing it cannot fail halfway.
+#[derive(Default)]
+struct RemovalPlan {
+    /// Surviving non-directory inodes and how many of their links are removed.
+    unlinked: Vec<(u32, u16)>,
+    /// Inodes whose final link is removed, in postorder.
+    released: Vec<u32>,
+    /// Physical block runs owned by the released inodes.
+    runs: Vec<(u32, u32)>,
+}
+
+/// Returns the directory-entry file type for an inode type.
+pub(crate) fn dir_entry_file_type(kind: u16) -> Option<u8> {
+    Some(match kind {
+        S_IFREG => EXT4_FT_REG_FILE,
+        S_IFDIR => EXT4_FT_DIR,
+        S_IFLNK => EXT4_FT_SYMLINK,
+        S_IFCHR => EXT4_FT_CHRDEV,
+        S_IFBLK => EXT4_FT_BLKDEV,
+        S_IFIFO => EXT4_FT_FIFO,
+        S_IFSOCK => EXT4_FT_SOCK,
+        _ => return None,
+    })
+}
+
+/// Returns the permissions applied when an inode of `kind` has no source mode.
+pub(crate) fn default_permissions(kind: u16) -> Option<u16> {
+    Some(match kind {
+        S_IFDIR => 0o755,
+        S_IFREG | S_IFIFO => 0o644,
+        S_IFLNK | S_IFSOCK => 0o777,
+        S_IFCHR | S_IFBLK => 0o660,
+        _ => return None,
+    })
+}
+
 impl Ext4ImageBuilder {
+    /// Replaces an inode's ownership, permissions, timestamps, and xattrs.
+    pub fn set_inode_metadata(&mut self, ino: u32, meta: &PosixMetadata) -> Result<()> {
+        if !self.is_inode_allocated(ino) {
+            return Err(anyhow::anyhow!("inode {ino} does not exist"));
+        }
+        let kind = self.inode(ino).file_type();
+        let default_perms = default_permissions(kind)
+            .ok_or_else(|| anyhow::anyhow!("inode {ino} has an unsupported type"))?;
+        let xattrs = prepare_xattrs(&meta.xattrs)?;
+        let (group, _) = self.inode_location(ino);
+        // Write the replacement before freeing the old block so a failed
+        // write leaves the inode's existing xattrs intact.
+        let new_xattr = if xattrs.is_empty() {
+            0
+        } else {
+            self.ensure_allocation_capacity(0, 1)?;
+            self.write_prepared_xattr_block(group, &xattrs)?
+        };
+        let old_xattr = self.inode(ino).i_file_acl_lo;
+        if old_xattr != 0 {
+            self.release_block(old_xattr)?;
+        }
+        let sectors = (BLOCK_SIZE / 512) as u32;
+        let inode = self.inode_mut(ino);
+        inode.i_blocks_lo = inode.i_blocks_lo - sectors * u32::from(old_xattr != 0)
+            + sectors * u32::from(new_xattr != 0);
+        inode.i_file_acl_lo = new_xattr;
+        Self::populate_inode_metadata(inode, meta, kind, default_perms);
+        Ok(())
+    }
+
+    /// Replaces only an inode's ownership, like chown(2) by root.
+    pub fn set_inode_owner(&mut self, ino: u32, uid: u32, gid: u32) -> Result<()> {
+        if !self.is_inode_allocated(ino) {
+            return Err(anyhow::anyhow!("inode {ino} does not exist"));
+        }
+        Self::populate_inode_owner(self.inode_mut(ino), uid, gid);
+        Ok(())
+    }
+
+    /// Parses one directory block, rejecting records that
+    /// ext2fs_process_dir_block() treats as EXT2_ET_DIR_CORRUPTED.
+    pub(crate) fn dir_block_records(&self, block: u32) -> Result<Vec<DirRecord>> {
+        let base = block as usize * BLOCK_SIZE;
+        let mut records = Vec::new();
+        let mut off = 0;
+        while off < BLOCK_SIZE {
+            let header = self
+                .disk_data
+                .get(base + off..base + off + 8)
+                .filter(|_| off + 8 <= BLOCK_SIZE)
+                .and_then(|bytes| Ext4DirEntry2Header::read_from_bytes(bytes).ok())
+                .ok_or_else(|| anyhow::anyhow!("directory block {block} is truncated"))?;
+            let rec_len = header.rec_len as usize;
+            let name_len = header.name_len as usize;
+            if rec_len < 8
+                || !rec_len.is_multiple_of(4)
+                || off + rec_len > BLOCK_SIZE
+                || name_len + 8 > rec_len
+            {
+                return Err(anyhow::anyhow!(
+                    "directory block {block} has an invalid record"
+                ));
+            }
+            records.push(DirRecord {
+                offset: base + off,
+                inode: header.inode,
+                rec_len,
+                name_len,
+                file_type: header.file_type,
+            });
+            off += rec_len;
+        }
+        Ok(records)
+    }
+
+    /// Returns the name bytes of a parsed directory record.
+    pub(crate) fn record_name(&self, record: &DirRecord) -> &[u8] {
+        &self.disk_data[record.offset + 8..record.offset + 8 + record.name_len]
+    }
+
+    /// Finds the live record for `name`, returning its block and record.
+    /// Indexed directories only scan the hash-selected leaf chain; dx root and
+    /// node blocks never hold ordinary names.
+    fn find_dir_record(&self, parent: u32, name: &str) -> Result<Option<(u32, DirRecord)>> {
+        Self::validate_name(name)?;
+        let blocks = if self.dir_is_indexed(parent)? {
+            self.htree_candidate_blocks(parent, self.dir_hash(name.as_bytes()))?
+        } else {
+            self.get_dir_blocks(parent)?
+        };
+        for block in blocks {
+            for record in self.dir_block_records(block)? {
+                if record.inode != 0 && self.record_name(&record) == name.as_bytes() {
+                    return Ok(Some((block, record)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// Looks up a child inode by name without changing the directory.
+    pub fn lookup_dir_entry(&self, parent: u32, name: &str) -> Result<Option<u32>> {
+        Ok(self
+            .find_dir_record(parent, name)?
+            .map(|(_, record)| record.inode))
+    }
+
+    /// Lists ordinary child entries as `(name, inode)`, excluding `.` and `..`.
+    /// Every block is scanned: dx root and node blocks parse as ordinary
+    /// directory blocks whose only live records are `.` and `..`.
+    pub fn directory_entries(&self, directory: u32) -> Result<Vec<(String, u32)>> {
+        let mut children = Vec::new();
+        for block in self.get_dir_blocks(directory)? {
+            for record in self.dir_block_records(block)? {
+                if record.inode == 0 {
+                    continue;
+                }
+                let name = std::str::from_utf8(self.record_name(&record)).map_err(|_| {
+                    anyhow::anyhow!("directory inode {directory} contains a non-UTF-8 name")
+                })?;
+                if name != "." && name != ".." {
+                    children.push((name.to_owned(), record.inode));
+                }
+            }
+        }
+        Ok(children)
+    }
+
+    /// Adds another name for an existing non-directory inode.
+    pub fn add_hard_link(&mut self, parent: u32, name: &str, inode_number: u32) -> Result<()> {
+        Self::validate_name(name)?;
+        if !self.is_inode_allocated(inode_number) {
+            return Err(anyhow::anyhow!("inode {inode_number} does not exist"));
+        }
+        let inode = self.inode(inode_number);
+        if inode.is_dir() {
+            return Err(anyhow::anyhow!(
+                "hard links to directories are not supported"
+            ));
+        }
+        let file_type = dir_entry_file_type(inode.file_type())
+            .ok_or_else(|| anyhow::anyhow!("inode {inode_number} has an unsupported type"))?;
+        if inode.i_links_count >= EXT4_LINK_MAX {
+            return Err(anyhow::anyhow!("inode {inode_number} has too many links"));
+        }
+        // Like ext2fs_link() callers, link first and only then account for
+        // the new name, so a failed insertion leaves the count untouched.
+        let expansion_blocks = self.estimate_dir_expansion_blocks(parent, name)?;
+        self.ensure_allocation_capacity(expansion_blocks, 0)?;
+        self.add_dir_entry(parent, name, inode_number, file_type)?;
+        self.inode_mut(inode_number).i_links_count += 1;
+        Ok(())
+    }
+
+    /// ext2fs_inc_nlink(): a directory with more than EXT4_LINK_MAX
+    /// subdirectories is pinned at one link (dir_nlink).
+    pub(crate) fn inc_dir_nlink(&mut self, directory: u32) {
+        let inode = self.inode_mut(directory);
+        if inode.i_links_count == 1 || inode.i_links_count >= EXT4_LINK_MAX {
+            inode.i_links_count = 1;
+        } else {
+            inode.i_links_count += 1;
+        }
+    }
+
+    /// ext2fs_dec_nlink(): a directory pinned at one link stays pinned.
+    fn dec_dir_nlink(&mut self, directory: u32) {
+        let inode = self.inode_mut(directory);
+        if inode.i_links_count > 2 {
+            inode.i_links_count -= 1;
+        }
+    }
+
+    /// Removes a named entry and recursively releases the inode and its blocks.
+    /// Returns `false` when no such entry exists.
+    pub fn remove_dir_entry(&mut self, parent: u32, name: &str) -> Result<bool> {
+        let Some((block, record)) = self.find_dir_record(parent, name)? else {
+            return Ok(false);
+        };
+        // Validate the whole subtree before mutating anything, so malformed
+        // deep children leave the tree untouched when removal fails.
+        let plan = self.plan_removal(record.inode)?;
+        let removes_directory = self.inode(record.inode).is_dir();
+
+        // Like debugfs kill_file_by_inode(): unlink the top-level name only;
+        // records inside released directories vanish with their blocks.
+        self.unlink_record(parent, block, record.offset)?;
+        if removes_directory {
+            self.dec_dir_nlink(parent);
+        }
+        for (inode, count) in plan.unlinked {
+            self.inode_mut(inode).i_links_count -= count;
+        }
+        for (start, len) in plan.runs {
+            self.release_blocks(start, len)
+                .expect("removal plan validated every released block");
+        }
+        for inode in plan.released {
+            if self.inode(inode).is_dir() {
+                let (group, _) = self.inode_location(inode);
+                self.group_descriptors[group].bg_used_dirs_count_lo -= 1;
+                self.invalidate_directory_cache(inode);
+            }
+            self.release_inode(inode)
+                .expect("removal plan validated every released inode");
+        }
+        Ok(true)
+    }
+
+    /// Collects the inodes, link counts and block runs released by removing
+    /// one link to `root`, without changing the filesystem.
+    fn plan_removal(&self, root: u32) -> Result<RemovalPlan> {
+        let mut non_dir_link_counts = HashMap::<u32, usize>::new();
+        let mut all_inodes_postorder = Vec::new();
+        let mut visited_directories = HashSet::new();
+        self.collect_removal_subtree(
+            root,
+            &mut non_dir_link_counts,
+            &mut all_inodes_postorder,
+            &mut visited_directories,
+        )?;
+
+        let mut plan = RemovalPlan::default();
+        let mut removed_dirs = vec![0usize; self.groups.len()];
+        for inode_number in all_inodes_postorder {
+            let inode = self.inode(inode_number);
+            if inode.is_dir() {
+                removed_dirs[self.inode_location(inode_number).0] += 1;
+            } else {
+                let removed = non_dir_link_counts[&inode_number];
+                let links = usize::from(inode.i_links_count);
+                if removed > links {
+                    return Err(anyhow::anyhow!(
+                        "inode {inode_number} has fewer links than entries being removed"
+                    ));
+                }
+                if removed < links {
+                    plan.unlinked.push((inode_number, removed as u16));
+                    continue;
+                }
+            }
+            plan.runs.extend(self.inode_storage_runs(inode)?);
+            plan.released.push(inode_number);
+        }
+        for (group, &count) in removed_dirs.iter().enumerate() {
+            if count > usize::from(self.group_descriptors[group].bg_used_dirs_count_lo) {
+                return Err(anyhow::anyhow!(
+                    "block group {group} has an inconsistent directory count"
+                ));
+            }
+        }
+
+        plan.runs.sort_unstable();
+        for (index, &(start, len)) in plan.runs.iter().enumerate() {
+            self.validate_allocated_run(start, len)?;
+            if let Some(&(next, _)) = plan.runs.get(index + 1)
+                && u64::from(start) + u64::from(len) > u64::from(next)
+            {
+                return Err(anyhow::anyhow!(
+                    "multiple inodes reference block {next} being released"
+                ));
+            }
+        }
+        Ok(plan)
+    }
+
+    /// Postorder walk of the subtree below `inode_number`, counting removed
+    /// links to non-directories and recording every inode once.
+    fn collect_removal_subtree(
+        &self,
+        inode_number: u32,
+        link_removals: &mut HashMap<u32, usize>,
+        order: &mut Vec<u32>,
+        visited: &mut HashSet<u32>,
+    ) -> Result<()> {
+        if !self.is_inode_allocated(inode_number) {
+            return Err(anyhow::anyhow!("inode {inode_number} does not exist"));
+        }
+        if !self.inode(inode_number).is_dir() {
+            let count = link_removals.entry(inode_number).or_default();
+            if *count == 0 {
+                order.push(inode_number);
+            }
+            *count += 1;
+            return Ok(());
+        }
+        if !visited.insert(inode_number) {
+            return Err(anyhow::anyhow!(
+                "directory inode {inode_number} appears more than once in the removal tree"
+            ));
+        }
+        for (_, child) in self.directory_entries(inode_number)? {
+            self.collect_removal_subtree(child, link_removals, order, visited)?;
+        }
+        order.push(inode_number);
+        Ok(())
+    }
+
+    /// Removes the record at absolute `offset` in directory `block` exactly as
+    /// e2fsprogs unlink_proc() does: merge it into the immediately preceding
+    /// record, or clear its inode when it is the first record of the block.
+    fn unlink_record(&mut self, parent: u32, block: u32, offset: usize) -> Result<()> {
+        let records = self.dir_block_records(block)?;
+        let index = records
+            .iter()
+            .position(|record| record.offset == offset)
+            .ok_or_else(|| anyhow::anyhow!("directory record disappeared before unlink"))?;
+        if index == 0 {
+            self.disk_data[offset..offset + 4].fill(0);
+        } else {
+            let previous = records[index - 1];
+            let merged = (previous.rec_len + records[index].rec_len) as u16;
+            self.disk_data[previous.offset + 4..previous.offset + 6]
+                .copy_from_slice(&merged.to_le_bytes());
+        }
+        self.invalidate_directory_cache(parent);
+        Ok(())
+    }
+
+    /// Returns the block runs an inode owns, following
+    /// ext2fs_inode_has_valid_blocks2(): only extent-mapped inodes have data
+    /// blocks here.  Fast symlinks and device nodes keep their payload in
+    /// `i_block`, which must never be decoded as block pointers.
+    fn inode_storage_runs(&self, inode: &Ext4Inode) -> Result<Vec<(u32, u32)>> {
+        let mut runs = Vec::new();
+        if inode.i_flags & EXT4_EXTENTS_FL != 0 {
+            let tree = self.read_extent_tree(inode)?;
+            runs.extend(
+                tree.leaves
+                    .iter()
+                    .map(|extent| (extent.ee_start_lo, extent_len(extent)))
+                    .filter(|&(_, len)| len != 0),
+            );
+            runs.extend(tree.tree_blocks.into_iter().map(|block| (block, 1)));
+        }
+        if inode.i_file_acl_lo != 0 {
+            runs.push((inode.i_file_acl_lo, 1));
+        }
+        Ok(runs)
+    }
+
     /// Discards linear-directory import state after callers directly alter its
     /// on-disk data or metadata. Indexed directories do not populate it.
     pub fn invalidate_directory_cache(&mut self, directory: u32) {
@@ -69,6 +462,14 @@ impl Ext4ImageBuilder {
         }
     }
 
+    /// Splits a 32-bit UID and GID across the inode's low and Linux high fields.
+    fn populate_inode_owner(inode: &mut Ext4Inode, uid: u32, gid: u32) {
+        inode.i_uid = uid as u16;
+        inode.i_gid = gid as u16;
+        inode.i_osd2[4..6].copy_from_slice(&((uid >> 16) as u16).to_le_bytes());
+        inode.i_osd2[6..8].copy_from_slice(&((gid >> 16) as u16).to_le_bytes());
+    }
+
     /// Applies POSIX metadata and file-type defaults to an inode; returns no value because it mutates in place.
     pub(crate) fn populate_inode_metadata(
         inode: &mut Ext4Inode,
@@ -76,16 +477,9 @@ impl Ext4ImageBuilder {
         kind: u16,
         default_perms: u16,
     ) {
-        let mode = if m.mode == 0 {
-            default_perms
-        } else {
-            m.mode & 0o7777
-        };
+        let mode = m.mode.map_or(default_perms, |mode| mode & 0o7777);
         inode.i_mode = kind | mode;
-        inode.i_uid = m.uid as u16;
-        inode.i_gid = m.gid as u16;
-        inode.i_osd2[4..6].copy_from_slice(&((m.uid >> 16) as u16).to_le_bytes());
-        inode.i_osd2[6..8].copy_from_slice(&((m.gid >> 16) as u16).to_le_bytes());
+        Self::populate_inode_owner(inode, m.uid, m.gid);
         inode.i_atime = m.atime;
         inode.i_ctime = m.ctime;
         inode.i_mtime = m.mtime;
@@ -174,8 +568,7 @@ impl Ext4ImageBuilder {
             self.group_descriptors[group].bg_used_dirs_count_lo -= 1;
             return Err(error);
         }
-        let (pgroup, pindex_in_group) = self.inode_location(parent);
-        self.groups[pgroup].inode_table[pindex_in_group].i_links_count += 1;
+        self.inc_dir_nlink(parent);
         Ok(ino)
     }
 
@@ -300,60 +693,32 @@ impl Ext4ImageBuilder {
         let mut names = HashSet::new();
 
         for (block_index, &block) in blocks.iter().enumerate() {
-            let base = block as usize * BLOCK_SIZE;
-            let mut off = 0;
-            while off < BLOCK_SIZE {
-                let e = Ext4DirEntry2Header::read_from_bytes(
-                    &self.disk_data[base + off..base + off + 8],
-                )
-                .map_err(|_| anyhow::anyhow!("invalid directory entry header"))?;
-                let len = e.rec_len as usize;
-                if len < 8
-                    || len % 4 != 0
-                    || off + len > BLOCK_SIZE
-                    || (e.inode != 0 && (e.name_len as usize + 8 > len))
-                {
-                    return Err(anyhow::anyhow!(
-                        "directory inode {parent} has an invalid record"
-                    ));
-                }
-
-                if e.inode != 0 {
-                    let entry_name = std::str::from_utf8(
-                        &self.disk_data[base + off + 8..base + off + 8 + e.name_len as usize],
-                    )
-                    .map_err(|_| {
+            for record in self.dir_block_records(block)? {
+                let entry_name = self.record_name(&record);
+                if record.inode != 0 {
+                    if entry_name == name_bytes {
+                        return Err(anyhow::anyhow!("directory entry {name:?} already exists"));
+                    }
+                    let entry_name = std::str::from_utf8(entry_name).map_err(|_| {
                         anyhow::anyhow!("directory inode {parent} contains a non-UTF-8 name")
                     })?;
                     names.insert(entry_name.to_owned());
-                    if e.name_len as usize == name_bytes.len()
-                        && &self.disk_data[base + off + 8..base + off + 8 + e.name_len as usize]
-                            == name_bytes
-                    {
-                        return Err(anyhow::anyhow!("directory entry {name:?} already exists"));
-                    }
-                    let actual = align4(8 + e.name_len as usize);
-                    if first_available_slot.is_none() && len >= actual + needed {
+                    let actual = align4(8 + record.name_len);
+                    if first_available_slot.is_none() && record.rec_len >= actual + needed {
                         first_available_slot = Some(DirSlot::SplitActiveRecord {
-                            offset: base + off,
+                            offset: record.offset,
                             actual,
-                            rec_len: len,
+                            rec_len: record.rec_len,
                         });
                         is_in_last_dir_block = block_index + 1 == blocks.len();
                     }
-                } else if first_available_slot.is_none() && len >= needed {
+                } else if first_available_slot.is_none() && record.rec_len >= needed {
                     first_available_slot = Some(DirSlot::EmptyRecord {
-                        offset: base + off,
-                        rec_len: len,
+                        offset: record.offset,
+                        rec_len: record.rec_len,
                     });
                     is_in_last_dir_block = block_index + 1 == blocks.len();
                 }
-                off += len;
-            }
-            if off != BLOCK_SIZE {
-                return Err(anyhow::anyhow!(
-                    "directory inode {parent} block did not end at block boundary"
-                ));
             }
         }
         self.directory_caches.insert(
@@ -370,16 +735,16 @@ impl Ext4ImageBuilder {
     pub(crate) fn expand_dir(&mut self, dir_ino: u32) -> Result<u32> {
         let (group, index_in_group) = self.inode_location(dir_ino);
         let inode = &self.groups[group].inode_table[index_in_group];
-        if inode.i_mode & S_IFDIR != S_IFDIR {
+        if !inode.is_dir() {
             return Err(anyhow::anyhow!("inode {dir_ino} is not a directory"));
         }
 
-        let mut leaf_extents = self.get_inode_extents(inode)?;
-
         // When write_extent_tree runs later, it serializes a completely new replacement tree.
         // We gather the old tree metadata block numbers so they can be safely reclaimed.
-        let mut old_tree_blocks = Vec::new();
-        self.collect_extent_tree_blocks(&inode.i_block, &mut old_tree_blocks)?;
+        let ExtentTree {
+            leaves: mut leaf_extents,
+            tree_blocks: old_tree_blocks,
+        } = self.read_extent_tree(inode)?;
 
         // Calculate the number of extents and tree metadata blocks needed in the worst scenario
         // and check if we have enough free blocks to allocate them.
@@ -574,10 +939,57 @@ mod tests {
     }
 
     #[test]
+    fn failed_deep_preflight_leaves_recursive_removal_unchanged() -> Result<()> {
+        let mut builder = fresh_builder()?;
+        let outer = builder.mkdir(EXT4_ROOT_INO, "outer", None)?;
+        let early_file = builder.add_file(
+            outer,
+            "a-file",
+            b"keep until removal commits",
+            &PosixMetadata::default(),
+        )?;
+        let deep = builder.mkdir(outer, "z-deep", None)?;
+        builder.add_file(
+            deep,
+            "nested-file",
+            b"invalid directory record follows",
+            &PosixMetadata::default(),
+        )?;
+        builder
+            .directory_caches
+            .insert(outer, DirectoryCache::default());
+        builder
+            .directory_caches
+            .insert(deep, DirectoryCache::default());
+
+        let free_blocks = builder.superblock.s_free_blocks_count_lo;
+        let free_inodes = builder.superblock.s_free_inodes_count;
+        let root_links = builder.groups[0].inode_table[1].i_links_count;
+        let deep_block = builder.get_dir_blocks(deep)?[0] as usize;
+        let deep_offset = deep_block * BLOCK_SIZE;
+        builder.disk_data[deep_offset + 4..deep_offset + 6].copy_from_slice(&0u16.to_le_bytes());
+
+        assert!(builder.remove_dir_entry(EXT4_ROOT_INO, "outer").is_err());
+        assert_eq!(
+            builder.lookup_dir_entry(EXT4_ROOT_INO, "outer")?,
+            Some(outer)
+        );
+        assert!(builder.is_inode_allocated(outer));
+        assert!(builder.is_inode_allocated(early_file));
+        assert!(builder.is_inode_allocated(deep));
+        assert_eq!({ builder.superblock.s_free_blocks_count_lo }, free_blocks);
+        assert_eq!({ builder.superblock.s_free_inodes_count }, free_inodes);
+        assert_eq!({ builder.inode(EXT4_ROOT_INO).i_links_count }, root_links);
+        assert!(builder.directory_caches.contains_key(&outer));
+        assert!(builder.directory_caches.contains_key(&deep));
+        Ok(())
+    }
+
+    #[test]
     fn file_is_linked_and_uses_contiguous_extent_and_xattrs() {
         let mut builder = fresh_builder().expect("failed to create builder");
         let mut metadata = PosixMetadata {
-            mode: 0o640,
+            mode: Some(0o640),
             uid: 70_000,
             gid: 80_000,
             mtime: 42,
@@ -614,7 +1026,7 @@ mod tests {
     fn metadata_directory_has_expected_type_and_parent_link() {
         let mut builder = fresh_builder().expect("failed to create builder");
         let metadata = PosixMetadata {
-            mode: 0o750,
+            mode: Some(0o750),
             uid: 1,
             gid: 2,
             ..Default::default()
@@ -742,7 +1154,7 @@ mod tests {
     fn char_and_block_device_nodes_encode_rdev() {
         let mut builder = fresh_builder().expect("failed to create builder");
         let metadata = PosixMetadata {
-            mode: 0o666,
+            mode: Some(0o666),
             ..Default::default()
         };
 
@@ -1107,5 +1519,26 @@ mod tests {
         assert_eq!(builder.disk_data[root_block + 30], 1);
         let root = builder.read_dx_entries(directory).unwrap();
         assert_eq!(root, vec![(0, 4)]);
+    }
+
+    #[test]
+    fn set_inode_owner_changes_only_ownership() -> Result<()> {
+        let mut builder = fresh_builder()?;
+        let metadata = PosixMetadata {
+            mode: Some(0o700),
+            mtime: 1_700_000_000,
+            ..Default::default()
+        };
+        let dir = builder.mkdir(EXT4_ROOT_INO, "dir", Some(&metadata))?;
+        builder.set_inode_owner(dir, 70_000, 80_000)?;
+
+        let inode = builder.inode(dir);
+        assert_eq!({ inode.i_uid }, 70_000u32 as u16);
+        assert_eq!({ inode.i_gid }, 80_000u32 as u16);
+        assert_eq!(&inode.i_osd2[4..8], &[1, 0, 1, 0]);
+        assert_eq!(inode.i_mode & 0o7777, 0o700);
+        assert_eq!({ inode.i_mtime }, 1_700_000_000);
+        assert!(builder.set_inode_owner(9999, 0, 0).is_err());
+        Ok(())
     }
 }

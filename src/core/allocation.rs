@@ -1,4 +1,5 @@
 use super::Ext4ImageBuilder;
+use crate::ext4::Ext4Inode;
 use anyhow::Result;
 
 impl Ext4ImageBuilder {
@@ -9,6 +10,23 @@ impl Ext4ImageBuilder {
             ((ino - 1) / inodes_per_group) as usize,
             ((ino - 1) % inodes_per_group) as usize,
         )
+    }
+
+    /// Returns the in-memory inode table record for `ino`.
+    pub fn inode(&self, ino: u32) -> &Ext4Inode {
+        let (group, index) = self.inode_location(ino);
+        &self.groups[group].inode_table[index]
+    }
+
+    /// Returns a mutable inode table record for `ino`.
+    pub(crate) fn inode_mut(&mut self, ino: u32) -> &mut Ext4Inode {
+        let (group, index) = self.inode_location(ino);
+        &mut self.groups[group].inode_table[index]
+    }
+
+    /// Returns whether `ino` is an allocated directory inode.
+    pub fn is_directory(&self, ino: u32) -> bool {
+        self.is_inode_allocated(ino) && self.inode(ino).is_dir()
     }
 
     /// Returns whether `ino` is valid and marked allocated in its inode bitmap.

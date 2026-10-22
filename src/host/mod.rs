@@ -1,7 +1,13 @@
 //! Import of a host-directory tree into an ext4 image.
 
-use super::{Ext4ImageBuilder, directory::PosixMetadata};
-use crate::ext4::{BLOCK_SIZE, BLOCKS_PER_GROUP, EXT4_ROOT_INO, INODE_SIZE};
+mod tree;
+
+pub use tree::HostTree;
+
+use crate::{
+    core::{Ext4ImageBuilder, PosixMetadata},
+    ext4::{BLOCK_SIZE, BLOCKS_PER_GROUP, EXT4_ROOT_INO, INODE_SIZE},
+};
 use anyhow::{Context, Result};
 use std::{
     collections::HashMap,
@@ -9,6 +15,7 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+use tree::{HostFileType, HostMetadata, HostUsage};
 
 impl Ext4ImageBuilder {
     /// Returns a filesystem size, in MiB, suitable for importing `source`.
@@ -82,9 +89,9 @@ impl Ext4ImageBuilder {
                 .checked_mul(1024 * 1024 / BLOCK_SIZE)
                 .ok_or_else(|| anyhow::anyhow!("image size overflow"))?;
             let groups = image_blocks.div_ceil(BLOCKS_PER_GROUP);
-            let inodes_per_group = (image_blocks / groups / 8) * 8;
+            let inodes_per_group = Self::inodes_per_group(image_blocks, groups);
             let inode_table_blocks = groups
-                .checked_mul(inodes_per_group * INODE_SIZE / BLOCK_SIZE)
+                .checked_mul((inodes_per_group * INODE_SIZE).div_ceil(BLOCK_SIZE))
                 .ok_or_else(|| anyhow::anyhow!("inode table size overflow"))?;
             // One block bitmap and one inode bitmap per group, plus primary
             // and sparse-super backup metadata. This is conservative.
@@ -131,6 +138,34 @@ impl Ext4ImageBuilder {
         self.import_host_path(parent, source)
     }
 
+    /// Forces `uid:gid` onto every entry imported from the host afterwards,
+    /// independent of the host's own ownership.  `None` restores the default:
+    /// host IDs on Unix and root elsewhere.  Directories created by
+    /// `ensure_host_destination` get the same owner, while existing image
+    /// entries, including directories that a host directory is merged into,
+    /// keep theirs.
+    pub fn set_host_owner(&mut self, owner: Option<(u32, u32)>) {
+        self.host_owner = owner;
+    }
+
+    /// Returns the destination directory for a host import at `path`,
+    /// creating missing components with the host owner, so that, e.g.,
+    /// importing into `/home/user` leaves `user` writable by that owner.
+    pub fn ensure_host_destination(&mut self, path: &str) -> Result<u32> {
+        let created = self
+            .host_owner
+            .map(|_| self.with_host_owner(PosixMetadata::default()));
+        self.ensure_directory_with(path, false, created.as_ref())
+    }
+
+    fn with_host_owner(&self, mut metadata: PosixMetadata) -> PosixMetadata {
+        if let Some((uid, gid)) = self.host_owner {
+            metadata.uid = uid;
+            metadata.gid = gid;
+        }
+        metadata
+    }
+
     /// Imports a regular file, directory, or symbolic link below `parent`.
     /// The imported entry retains its host basename and returns its inode.
     pub fn import_host_path(&mut self, parent: u32, source: impl AsRef<Path>) -> Result<u32> {
@@ -152,6 +187,47 @@ impl Ext4ImageBuilder {
         source: impl AsRef<Path>,
     ) -> Result<u32> {
         self.import_host_path_streaming_impl(parent, source.as_ref())
+    }
+
+    /// Merges a host directory into an existing ext4 directory.  Host entries
+    /// replace like-named non-directories; like-named directories are merged.
+    /// The existing directory keeps its own metadata (mode, owner, xattrs),
+    /// as when copying into a directory that already exists.
+    pub fn overlay_host_directory(&mut self, parent: u32, source: impl AsRef<Path>) -> Result<()> {
+        let source = source.as_ref();
+        let metadata = fs::symlink_metadata(source)
+            .with_context(|| format!("cannot inspect host directory {}", source.display()))?;
+        if !metadata.file_type().is_dir() {
+            return Err(anyhow::anyhow!(
+                "host overlay source is not a directory: {}",
+                source.display()
+            ));
+        }
+        self.merge_host_directory(parent, source)
+    }
+
+    fn merge_host_directory(&mut self, parent: u32, source: &Path) -> Result<()> {
+        for path in Self::sorted_host_entries(source)? {
+            let name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    anyhow::anyhow!("host path name is not valid UTF-8: {}", path.display())
+                })?;
+            if let Some(existing) = self.lookup_dir_entry(parent, name)? {
+                let host_is_dir = fs::symlink_metadata(&path)
+                    .with_context(|| format!("cannot inspect host path {}", path.display()))?
+                    .file_type()
+                    .is_dir();
+                if host_is_dir && self.is_directory(existing) {
+                    self.merge_host_directory(existing, &path)?;
+                    continue;
+                }
+                self.remove_dir_entry(parent, name)?;
+            }
+            self.import_host_path_impl(parent, &path)?;
+        }
+        Ok(())
     }
 
     fn import_host_path_streaming_impl(&mut self, parent: u32, source: &Path) -> Result<u32> {
@@ -200,7 +276,7 @@ impl Ext4ImageBuilder {
             };
             let metadata =
                 HostMetadata::from_std(&std_metadata, file_type == HostFileType::Directory);
-            let host_meta = metadata.as_posix();
+            let host_meta = self.with_host_owner(metadata.as_posix());
 
             let inode = match file_type {
                 HostFileType::Directory => {
@@ -255,7 +331,7 @@ impl Ext4ImageBuilder {
             })?;
         Self::validate_name(name)?;
         let file_type = metadata.file_type();
-        let host_meta = Self::host_metadata(&metadata, file_type.is_dir());
+        let host_meta = self.with_host_owner(Self::host_metadata(&metadata, file_type.is_dir()));
         if file_type.is_dir() {
             let directory = self.mkdir(parent, name, Some(&host_meta))?;
             self.import_host_directory_contents(directory, source)?;
@@ -298,7 +374,7 @@ impl Ext4ImageBuilder {
                         entry.path.display()
                     )
                 })?;
-            let host_meta = entry.metadata.as_posix();
+            let host_meta = self.with_host_owner(entry.metadata.as_posix());
             let inode = if entry.file_type == HostFileType::Directory {
                 let inode = self.mkdir(parent_inode, name, Some(&host_meta))?;
                 inode
@@ -334,31 +410,21 @@ impl Ext4ImageBuilder {
         self.import_host_path(EXT4_ROOT_INO, source)
     }
 
-    /// Creates an absolute directory path in a newly created image and returns
-    /// its final inode. Existing paths are not looked up by this builder.
-    pub fn create_directory_path(&mut self, path: &str) -> Result<u32> {
-        if !path.starts_with('/') {
-            return Err(anyhow::anyhow!("destination path must be absolute: {path}"));
-        }
-        let mut parent = EXT4_ROOT_INO;
-        for component in path.split('/').filter(|component| !component.is_empty()) {
-            Self::validate_name(component)?;
-            parent = self.mkdir(parent, component, None)?;
-        }
-        Ok(parent)
-    }
-
-    /// Imports sorted children of a host directory below an existing inode.
-    fn import_host_directory_contents(&mut self, parent: u32, source: &Path) -> Result<()> {
+    /// Returns a host directory's children in a stable order, which keeps
+    /// generated images reproducible for an unchanged tree.
+    fn sorted_host_entries(source: &Path) -> Result<Vec<PathBuf>> {
         let mut entries: Vec<PathBuf> = fs::read_dir(source)
             .with_context(|| format!("cannot read host directory {}", source.display()))?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<std::io::Result<_>>()
             .with_context(|| format!("cannot enumerate host directory {}", source.display()))?;
-        // A stable order makes generated images reproducible for an unchanged tree.
         entries.sort();
+        Ok(entries)
+    }
 
-        for path in entries {
+    /// Imports sorted children of a host directory below an existing inode.
+    fn import_host_directory_contents(&mut self, parent: u32, source: &Path) -> Result<()> {
+        for path in Self::sorted_host_entries(source)? {
             self.import_host_path_impl(parent, &path)?;
         }
         Ok(())
@@ -378,7 +444,7 @@ impl Ext4ImageBuilder {
                 .map_or(0, |value| value.as_secs().min(u32::MAX as u64) as u32)
         };
         PosixMetadata {
-            mode,
+            mode: Some(mode),
             atime: timestamp(metadata.accessed()),
             ctime: timestamp(metadata.created()),
             mtime: timestamp(metadata.modified()),
@@ -387,238 +453,9 @@ impl Ext4ImageBuilder {
     }
 }
 
-#[derive(Clone, Copy, Default)]
-struct HostUsage {
-    data_blocks: u64,
-    inodes: u64,
-}
-
-/// A pre-order host-tree snapshot used to size and import an image without a
-/// second metadata or directory-enumeration pass. Entries live in a flat arena
-/// so scanning and importing arbitrarily deep directory trees never recurse.
-pub struct HostTree {
-    entries: Vec<HostEntry>,
-    usage: HostUsage,
-}
-
-struct HostEntry {
-    path: PathBuf,
-    metadata: HostMetadata,
-    file_type: HostFileType,
-    symlink_target: Option<String>,
-    parent_index: Option<usize>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum HostFileType {
-    Directory,
-    File,
-    Symlink,
-}
-
-/// Compact, platform-neutral metadata retained between the scan and import
-/// passes. Unlike `fs::Metadata`, this stores only values written to ext4.
-#[derive(Clone, Copy, Debug, Default)]
-struct HostMetadata {
-    size: u64,
-    uid: u32,
-    gid: u32,
-    mode: u16,
-    atime: u32,
-    ctime: u32,
-    mtime: u32,
-}
-
-impl HostMetadata {
-    fn from_std(metadata: &fs::Metadata, is_dir: bool) -> Self {
-        let default_mode = if is_dir { 0o755 } else { 0o644 };
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            Self {
-                size: metadata.len(),
-                uid: metadata.uid(),
-                gid: metadata.gid(),
-                mode: (metadata.mode() & 0o7777) as u16,
-                atime: clamp_unix_timestamp(metadata.atime()),
-                ctime: clamp_unix_timestamp(metadata.ctime()),
-                mtime: clamp_unix_timestamp(metadata.mtime()),
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            let mode = if metadata.permissions().readonly() {
-                default_mode & !0o222
-            } else {
-                default_mode
-            };
-            Self {
-                size: metadata.len(),
-                mode,
-                atime: system_time_seconds(metadata.accessed()),
-                ctime: system_time_seconds(metadata.created()),
-                mtime: system_time_seconds(metadata.modified()),
-                ..Self::default()
-            }
-        }
-    }
-
-    fn as_posix(self) -> PosixMetadata {
-        PosixMetadata {
-            mode: self.mode,
-            uid: self.uid,
-            gid: self.gid,
-            atime: self.atime,
-            ctime: self.ctime,
-            mtime: self.mtime,
-            ..Default::default()
-        }
-    }
-}
-
-#[cfg(unix)]
-fn clamp_unix_timestamp(seconds: i64) -> u32 {
-    seconds.clamp(0, i64::from(u32::MAX)) as u32
-}
-
-fn system_time_seconds(time: std::io::Result<SystemTime>) -> u32 {
-    time.ok()
-        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-        .map_or(0, |value| value.as_secs().min(u64::from(u32::MAX)) as u32)
-}
-
-struct PendingHostEntry {
-    entry: HostEntry,
-    directory_id: Option<dua_core::DirectoryId>,
-    parent_directory_id: Option<dua_core::DirectoryId>,
-}
-
-impl HostTree {
-    /// Streams `source` through dua-core's bounded parallel walker and retains
-    /// compact metadata in a stable pre-order arena for sizing and import.
-    pub fn scan(source: impl AsRef<Path>) -> Result<Self> {
-        let mut usage = HostUsage::default();
-        let mut pending = Vec::with_capacity(8192);
-        let mut directory_bytes = HashMap::new();
-        let threads = std::thread::available_parallelism().map_or(1, usize::from);
-        let walker = dua_core::walk(
-            source.as_ref(),
-            threads,
-            dua_core::Order::ParentFirst,
-            dua_core::Options::default(),
-            |_| true,
-        );
-
-        for walked in walker {
-            let walked = walked
-                .with_context(|| format!("cannot walk host tree {}", source.as_ref().display()))?;
-            let path = walked.path();
-            let std_metadata = fs::symlink_metadata(&path)
-                .with_context(|| format!("cannot inspect host path {}", path.display()))?;
-            let file_type = if walked.file_type.is_dir() {
-                HostFileType::Directory
-            } else if walked.file_type.is_file() {
-                HostFileType::File
-            } else if walked.file_type.is_symlink() {
-                HostFileType::Symlink
-            } else {
-                return Err(anyhow::anyhow!(
-                    "unsupported host file type at {} (only files, directories, and symlinks can be imported)",
-                    path.display()
-                ));
-            };
-            let metadata =
-                HostMetadata::from_std(&std_metadata, file_type == HostFileType::Directory);
-            let mut symlink_target = None;
-
-            usage.inodes += 1;
-            if walked.depth > 0 {
-                let name = walked.file_name.to_str().ok_or_else(|| {
-                    anyhow::anyhow!("host path is not valid UTF-8: {}", path.display())
-                })?;
-                Ext4ImageBuilder::validate_name(name)?;
-                *directory_bytes
-                    .entry(
-                        walked
-                            .parent_directory_id
-                            .expect("non-root entry has a parent"),
-                    )
-                    .or_insert(24u64) += (8 + name.len()).next_multiple_of(4) as u64;
-            }
-
-            if file_type == HostFileType::Directory {
-                directory_bytes
-                    .entry(walked.directory_id.expect("directory has an id"))
-                    .or_insert(24);
-            } else if file_type == HostFileType::File {
-                usage.data_blocks += metadata.size.div_ceil(BLOCK_SIZE as u64);
-            } else {
-                let target = fs::read_link(&path)
-                    .with_context(|| format!("cannot read symbolic link {}", path.display()))?;
-                let target = target.to_str().ok_or_else(|| {
-                    anyhow::anyhow!(
-                        "symbolic-link target is not valid UTF-8: {}",
-                        path.display()
-                    )
-                })?;
-                if target.len() >= BLOCK_SIZE {
-                    return Err(anyhow::anyhow!(
-                        "symlink target must be no longer than {} bytes: {}",
-                        BLOCK_SIZE - 1,
-                        path.display()
-                    ));
-                }
-                usage.data_blocks += u64::from(target.len() >= 60);
-                symlink_target = Some(target.to_owned());
-            }
-
-            pending.push(PendingHostEntry {
-                entry: HostEntry {
-                    path,
-                    metadata,
-                    file_type,
-                    symlink_target,
-                    parent_index: None,
-                },
-                directory_id: walked.directory_id,
-                parent_directory_id: walked.parent_directory_id,
-            });
-        }
-
-        // Parallel completion does not define sibling order. Sorting full paths
-        // restores deterministic pre-order while directory IDs preserve parents.
-        pending.sort_unstable_by(|left, right| left.entry.path.cmp(&right.entry.path));
-        let directory_indices: HashMap<_, _> = pending
-            .iter()
-            .enumerate()
-            .filter_map(|(index, entry)| entry.directory_id.map(|id| (id, index)))
-            .collect();
-        let entries = pending
-            .into_iter()
-            .map(|mut pending| {
-                pending.entry.parent_index =
-                    pending.parent_directory_id.map(|id| directory_indices[&id]);
-                pending.entry
-            })
-            .collect();
-        usage.data_blocks += directory_bytes
-            .values()
-            .map(|bytes| bytes.div_ceil(BLOCK_SIZE as u64))
-            .sum::<u64>();
-
-        Ok(Self { entries, usage })
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn retained_host_metadata_is_compact() {
-        assert_eq!(std::mem::size_of::<HostMetadata>(), 32);
-        assert!(std::mem::size_of::<HostMetadata>() < std::mem::size_of::<fs::Metadata>());
-    }
 
     #[test]
     fn imports_nested_host_tree() -> Result<()> {
@@ -688,33 +525,53 @@ mod tests {
     }
 
     #[test]
-    fn scanned_tree_is_a_preorder_flat_arena() -> Result<()> {
-        let base = std::env::temp_dir().join(format!("ext4kit-arena-{}", std::process::id()));
+    fn overlay_replacing_a_nested_directory_releases_links_and_caches() -> Result<()> {
+        let base =
+            std::env::temp_dir().join(format!("ext4kit-overlay-remove-{}", std::process::id()));
+        let incoming = base.join("incoming");
         let _ = fs::remove_dir_all(&base);
-        fs::create_dir_all(base.join("a").join("nested"))?;
-        fs::write(base.join("a").join("nested").join("child"), b"child")?;
-        fs::write(base.join("z"), b"z")?;
+        fs::create_dir_all(&incoming)?;
+        fs::write(incoming.join("replacement"), b"new file")?;
 
-        let tree = HostTree::scan(&base)?;
-        assert_eq!(tree.entries[0].parent_index, None);
-        for (index, entry) in tree.entries.iter().enumerate().skip(1) {
-            assert!(entry.parent_index.is_some_and(|parent| parent < index));
-        }
-        let names: Vec<_> = tree
-            .entries
-            .iter()
-            .map(|entry| entry.path.file_name().unwrap().to_str().unwrap())
-            .collect();
+        let mut builder = Ext4ImageBuilder::new(16);
+        builder.create_root_dir()?;
+        builder.create_lost_and_found()?;
+        builder.reserve_inodes();
+
+        let overlay = builder.mkdir(EXT4_ROOT_INO, "overlay", None)?;
+        let replacement_dir = builder.mkdir(overlay, "replacement", None)?;
+        let nested_dir = builder.mkdir(replacement_dir, "nested", None)?;
+        builder.add_file(
+            nested_dir,
+            "old.txt",
+            b"old file",
+            &PosixMetadata::default(),
+        )?;
+        builder
+            .directory_caches
+            .insert(replacement_dir, Default::default());
+        builder
+            .directory_caches
+            .insert(nested_dir, Default::default());
+
+        let free_inodes = builder.superblock.s_free_inodes_count;
+        builder.overlay_host_directory(overlay, &incoming)?;
+
+        let replacement = builder
+            .lookup_dir_entry(overlay, "replacement")?
+            .expect("overlay should import the replacement file");
+        assert_eq!(builder.inode(replacement).file_type(), crate::ext4::S_IFREG);
+        assert_eq!({ builder.inode(EXT4_ROOT_INO).i_links_count }, 4);
+        assert_eq!({ builder.inode(overlay).i_links_count }, 2);
+        assert_eq!({ builder.group_descriptors[0].bg_used_dirs_count_lo }, 3);
+        // Two directories and one file were released; the replacement file
+        // may reuse one of their inode numbers.
         assert_eq!(
-            names,
-            [
-                base.file_name().unwrap().to_str().unwrap(),
-                "a",
-                "nested",
-                "child",
-                "z"
-            ]
+            { builder.superblock.s_free_inodes_count },
+            free_inodes + 3 - 1
         );
+        assert!(!builder.directory_caches.contains_key(&replacement_dir));
+        assert!(!builder.directory_caches.contains_key(&nested_dir));
 
         fs::remove_dir_all(base)?;
         Ok(())
@@ -740,6 +597,122 @@ mod tests {
             builder.groups[group].inode_table[index].i_mode & 0xf000,
             crate::ext4::S_IFREG
         );
+
+        fs::remove_dir_all(base)?;
+        Ok(())
+    }
+
+    fn inode_owner(builder: &Ext4ImageBuilder, inode: u32) -> (u32, u32) {
+        let (group, index) = builder.inode_location(inode);
+        let raw = &builder.groups[group].inode_table[index];
+        let high = |offset: usize| {
+            u32::from(u16::from_le_bytes([
+                raw.i_osd2[offset],
+                raw.i_osd2[offset + 1],
+            ]))
+        };
+        (
+            u32::from({ raw.i_uid }) | high(4) << 16,
+            u32::from({ raw.i_gid }) | high(6) << 16,
+        )
+    }
+
+    #[test]
+    fn host_owner_applies_to_every_import_path() -> Result<()> {
+        let base = std::env::temp_dir().join(format!("ext4kit-chown-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let source = base.join("app");
+        fs::create_dir_all(source.join("src"))?;
+        fs::write(source.join("src").join("main.rs"), b"fn main() {}")?;
+        let owner = (70_000, 80_001);
+
+        let mut builder = Ext4ImageBuilder::new(16);
+        builder.create_root_dir()?;
+        builder.create_lost_and_found()?;
+        builder.reserve_inodes();
+        builder.set_host_owner(Some(owner));
+        let tree = HostTree::scan(&source)?;
+        let imports = [
+            builder.create_directory_path("/tree")?,
+            builder.create_directory_path("/streamed")?,
+            builder.create_directory_path("/recursive")?,
+        ];
+        builder.import_host_tree(imports[0], &tree)?;
+        builder.import_host_path_streaming(imports[1], &source)?;
+        builder.import_host_path(imports[2], &source)?;
+
+        for parent in imports {
+            let app = builder
+                .lookup_dir_entry(parent, "app")?
+                .expect("app imported");
+            let src = builder.lookup_dir_entry(app, "src")?.expect("src imported");
+            let main = builder
+                .lookup_dir_entry(src, "main.rs")?
+                .expect("file imported");
+            for inode in [app, src, main] {
+                assert_eq!(inode_owner(&builder, inode), owner);
+            }
+            // `create_directory_path` ignores the host owner.
+            assert_eq!(inode_owner(&builder, parent), (0, 0));
+        }
+
+        fs::remove_dir_all(base)?;
+        Ok(())
+    }
+
+    #[test]
+    fn host_destination_owns_only_created_directories() -> Result<()> {
+        let mut builder = Ext4ImageBuilder::new(16);
+        builder.create_root_dir()?;
+        builder.create_lost_and_found()?;
+        builder.reserve_inodes();
+        let home = builder.ensure_directory("/home", false)?;
+        let unowned = builder.ensure_host_destination("/srv/app")?;
+        builder.set_host_owner(Some((1000, 1001)));
+        let user = builder.ensure_host_destination("/home/test/src")?;
+
+        assert_eq!(inode_owner(&builder, EXT4_ROOT_INO), (0, 0));
+        assert_eq!(inode_owner(&builder, home), (0, 0));
+        assert_eq!(inode_owner(&builder, unowned), (0, 0));
+        let test = builder
+            .lookup_dir_entry(home, "test")?
+            .expect("test created");
+        assert_eq!(inode_owner(&builder, test), (1000, 1001));
+        assert_eq!(inode_owner(&builder, user), (1000, 1001));
+        assert_eq!(builder.inode(user).i_mode & 0o7777, 0o755);
+        Ok(())
+    }
+
+    #[test]
+    fn host_owner_overlay_keeps_existing_directory_owner() -> Result<()> {
+        let base =
+            std::env::temp_dir().join(format!("ext4kit-chown-overlay-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("nested"))?;
+        fs::write(base.join("nested").join("child.txt"), b"child")?;
+
+        let mut builder = Ext4ImageBuilder::new(16);
+        builder.create_root_dir()?;
+        builder.create_lost_and_found()?;
+        builder.reserve_inodes();
+        let existing_meta = PosixMetadata {
+            uid: 5,
+            gid: 6,
+            ..Default::default()
+        };
+        let existing = builder.mkdir(EXT4_ROOT_INO, "existing", Some(&existing_meta))?;
+        builder.set_host_owner(Some((1000, 1000)));
+        builder.overlay_host_directory(existing, &base)?;
+
+        let nested = builder
+            .lookup_dir_entry(existing, "nested")?
+            .expect("nested merged");
+        let child = builder
+            .lookup_dir_entry(nested, "child.txt")?
+            .expect("child merged");
+        assert_eq!(inode_owner(&builder, existing), (5, 6));
+        assert_eq!(inode_owner(&builder, nested), (1000, 1000));
+        assert_eq!(inode_owner(&builder, child), (1000, 1000));
 
         fs::remove_dir_all(base)?;
         Ok(())
