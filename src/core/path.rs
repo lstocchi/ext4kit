@@ -153,6 +153,20 @@ impl Ext4ImageBuilder {
         }
         Ok(*stack.last().expect("the walk always keeps the root"))
     }
+
+    /// Creates an absolute directory path in a newly created image and returns
+    /// its final inode. Existing paths are not looked up by this builder.
+    pub fn create_directory_path(&mut self, path: &str) -> Result<u32> {
+        if !path.starts_with('/') {
+            return Err(anyhow::anyhow!("destination path must be absolute: {path}"));
+        }
+        let mut parent = EXT4_ROOT_INO;
+        for component in path.split('/').filter(|component| !component.is_empty()) {
+            Self::validate_name(component)?;
+            parent = self.mkdir(parent, component, None)?;
+        }
+        Ok(parent)
+    }
 }
 
 #[cfg(test)]

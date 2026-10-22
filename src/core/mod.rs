@@ -17,13 +17,11 @@ pub mod directory;
 pub mod dirhash;
 mod extent;
 mod file;
-mod host;
 mod htree;
 mod path;
 mod special;
 mod symlink;
 pub use directory::PosixMetadata;
-pub use host::HostTree;
 
 // ============================================================================
 // Ext4 Image Writer Engine

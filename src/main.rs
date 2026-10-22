@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use ext4kit::{
-    core::{Ext4ImageBuilder, HostTree},
+    core::Ext4ImageBuilder,
+    host::HostTree,
     oci::{
         image_size_mib,
         local::{Engine, LocalImage},
