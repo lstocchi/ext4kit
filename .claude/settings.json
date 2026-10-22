@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo build:*)",
+      "Bash(cargo test:*)",
+      "Bash(cargo check:*)",
+      "Bash(cargo fmt:*)",
+      "Bash(cargo clippy:*)",
+      "Bash(bash scripts/verify-image.sh:*)",
+      "PowerShell(cargo build:*)",
+      "PowerShell(cargo test:*)",
+      "PowerShell(cargo check:*)",
+      "PowerShell(cargo fmt:*)",
+      "PowerShell(cargo clippy:*)",
+      "PowerShell(bash scripts/verify-image.sh:*)"
+    ]
+  }
+}

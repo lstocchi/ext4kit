@@ -75,7 +75,9 @@ external xattr block.
 - Layout is modeled on `e2fsprogs` and written directly using ext4 structures.
 - The implementation uses 32-bit block addresses and 32-byte group descriptors.
 - Images are deliberately created without a journal.
-- Hard links, sparse files, inline/shared xattrs, SELinux validation, OCI
-  whiteouts, UUID generation, and OCI import are not implemented yet.
+- Sparse files, inline/shared xattrs, SELinux validation, and UUID generation
+  are not implemented yet.
 - Host import preserves the portable subset of metadata supported by the host
-  OS. OCI metadata extraction is still to be implemented.
+  OS. OCI import applies layer metadata, whiteouts (including opaque
+  directories), and hard links; only linux/amd64 images and anonymous registry
+  access are supported.
