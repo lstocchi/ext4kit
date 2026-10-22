@@ -156,7 +156,7 @@ pub(crate) fn posix_acl_to_ext4_disk(value: &[u8]) -> Result<Vec<u8>> {
     }
     let mut disk = Vec::with_capacity(value.len());
     disk.extend_from_slice(&1u32.to_le_bytes());
-    for entry in value[4..].chunks_exact(8) {
+    for entry in value[4..].as_chunks::<8>().0 {
         let tag = u16::from_le_bytes(entry[..2].try_into().unwrap());
         let perm = u16::from_le_bytes(entry[2..4].try_into().unwrap());
         if perm > 0o7 {

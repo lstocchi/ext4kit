@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+
+jobs:
+  lint:
+    name: fmt and clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows is the primary target; Linux also runs every image through
+        # e2fsck, which the Windows runners lack.
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install e2fsprogs
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs
+          echo "EXT4KIT_REQUIRE_E2FSPROGS=1" >> "$GITHUB_ENV"
+      - name: Unit tests
+        run: cargo test --lib --bins
+      - name: Integration tests
+        run: cargo test --test cli
+
+  oci:
+    name: OCI integration tests
+    runs-on: ubuntu-latest
+    env:
+      EXT4KIT_REQUIRE_E2FSPROGS: "1"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install e2fsprogs
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs
+      - name: Pull the base image into the Docker engine
+        run: docker pull docker.io/library/alpine:3.20
+      - name: OCI tests (registry and docker-daemon)
+        run: cargo test --test oci -- --ignored

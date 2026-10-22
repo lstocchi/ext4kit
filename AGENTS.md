@@ -18,7 +18,10 @@ on-disk change has to be verified with e2fsprogs (see [Verifying images](#verify
 
 ```sh
 cargo build
-cargo test                       # ~70 unit tests, run offline in well under a second
+cargo test --lib --bins          # unit tests, offline, well under a second
+cargo test --test cli            # end-to-end: builds images and runs e2fsck (~15 s)
+cargo test                       # both of the above
+cargo test --test oci -- --ignored  # --from tests; need network and Docker
 cargo test <name_substring>      # a single test
 cargo fmt                        # CI-style check: cargo fmt --check
 cargo clippy --all-targets       # must report zero warnings
@@ -87,17 +90,26 @@ streaming import design.
 
 ## Tests
 
-- Unit tests live in `#[cfg(test)] mod tests` beside the code. There is no
-  `tests/` directory.
+- Unit tests live in `#[cfg(test)] mod tests` beside the code.
+- End-to-end tests live in `tests/`. `cli.rs` runs the real binary on
+  generated host trees and checks every image with `e2fsck -fn` and
+  `debugfs`, using the helpers in `tests/common/mod.rs` (`create`, then
+  `Image::check` and `cat`/`stat`/`owner`/`list`). e2fsprogs is found
+  natively or through WSL, like the verify script. When it is missing the
+  checks are skipped with a note; CI sets `EXT4KIT_REQUIRE_E2FSPROGS=1` so
+  they fail instead. `oci.rs` holds `#[ignore]`d `--from` tests that need
+  Docker Hub or a Docker engine.
 - Build small images in memory with `Ext4ImageBuilder::new(16)`, then call
   `create_root_dir()`, `create_lost_and_found()` and `reserve_inodes()`
   (see `fresh_builder()` in `core/directory.rs`). Assert by reading back
   through the builder (`lookup_dir_entry`, `inode`, `directory_entries`,
   `get_dir_blocks`) and by comparing free counts before and after.
 - OCI tests build synthetic tar/gzip layers in memory (`layer()` helper in
-  `oci/mod.rs`). Tests must not need the network, Docker or Podman.
-- Unit tests can't catch a structurally wrong image. For on-disk changes you
-  also need an end-to-end check with `e2fsck`, described next.
+  `oci/mod.rs`). Tests that are not `#[ignore]`d must not need the network,
+  Docker or Podman.
+- Unit tests can't catch a structurally wrong image. For a new on-disk feature,
+  add a case to `tests/cli.rs` whose fixture exercises it, and use the
+  verify script described next for ad-hoc checks.
 
 ## Verifying images
 
@@ -129,6 +141,9 @@ trees. The `/verify-image` skill in `.claude/skills/` walks through this.
   Windows path list, and backslashes passed to `wsl` vanish. Give `--add` a
   `C:/...` path from `cygpath -m` (as in the snippet above), use
   `MSYS_NO_PATHCONV=1` for `wsl`, or just use the verify script.
+- `debugfs -R 'htree DIR'` prints "Directory block does not have space for
+  checksum" on every indexed directory. Images built by `mke2fs` without
+  `metadata_csum` get the same message, so it is not an ext4kit bug.
 - The ext4 hash seed is random per image, so dx-directory layouts differ from
   run to run. Do not write tests that compare whole-image bytes.
 - `--from` without `docker://` queries the local engine first. Behavior can

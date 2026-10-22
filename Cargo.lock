@@ -488,6 +488,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "tar",
+ "tempfile",
  "tokio",
  "tokio-util",
  "zerocopy",

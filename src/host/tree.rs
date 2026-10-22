@@ -9,7 +9,6 @@ use std::{
     collections::HashMap,
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Clone, Copy, Default)]
@@ -56,10 +55,10 @@ pub(super) struct HostMetadata {
 
 impl HostMetadata {
     pub(super) fn from_std(metadata: &fs::Metadata, is_dir: bool) -> Self {
-        let default_mode = if is_dir { 0o755 } else { 0o644 };
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
+            let _ = is_dir; // Unix hosts supply real permission bits.
             Self {
                 size: metadata.len(),
                 uid: metadata.uid(),
@@ -72,6 +71,7 @@ impl HostMetadata {
         }
         #[cfg(not(unix))]
         {
+            let default_mode = if is_dir { 0o755 } else { 0o644 };
             let mode = if metadata.permissions().readonly() {
                 default_mode & !0o222
             } else {
@@ -106,9 +106,10 @@ fn clamp_unix_timestamp(seconds: i64) -> u32 {
     seconds.clamp(0, i64::from(u32::MAX)) as u32
 }
 
-fn system_time_seconds(time: std::io::Result<SystemTime>) -> u32 {
+#[cfg(not(unix))]
+fn system_time_seconds(time: std::io::Result<std::time::SystemTime>) -> u32 {
     time.ok()
-        .and_then(|value| value.duration_since(UNIX_EPOCH).ok())
+        .and_then(|value| value.duration_since(std::time::UNIX_EPOCH).ok())
         .map_or(0, |value| value.as_secs().min(u64::from(u32::MAX)) as u32)
 }
 

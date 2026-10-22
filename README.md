@@ -107,6 +107,19 @@ files, run `debugfs -R 'stat /path/to/file' output.img` to inspect the extent
 tree. Run `debugfs -R 'stat /path/to/directory' output.img` to confirm a grown
 directory's size, block count, and directory extents.
 
+## Testing
+
+```sh
+cargo test                           # unit tests plus end-to-end image tests
+cargo test --test oci -- --ignored   # --from tests (Docker Hub and a Docker engine)
+```
+
+The end-to-end tests in `tests/` run the CLI and check every image with
+`e2fsck` and `debugfs`. They find e2fsprogs on Linux, or through WSL on
+Windows, and skip those checks with a note when it is missing. CI
+(`.github/workflows/ci.yml`) runs the tests on Linux and Windows, and runs the
+`--from` tests on Linux.
+
 ## Documentation
 
 - [Architecture](docs/architecture.md)
