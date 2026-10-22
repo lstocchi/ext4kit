@@ -60,11 +60,39 @@ or Windows named pipes:
 cargo run -- create --from docker-daemon:alpine:latest output.img
 ```
 
+Files added from Windows have no POSIX owner and are created as `root:root`
+(on Unix hosts the host UID/GID is kept). Use `--chown` to give everything
+imported with `--add` to the guest user, like a Dockerfile `COPY --chown`, so
+it can be edited and built without `sudo chown` inside the VM. Destination
+directories that ext4kit creates for an addition get the same owner, while
+directories that already exist, from `--from` or an earlier `--add`, keep
+theirs. `--from` image entries are never re-owned, since a base system relies
+on its own ownership (`/etc/shadow`, setuid binaries, service accounts).
+
+`--root-owner` sets the owner of the filesystem root directory, like
+`mke2fs -E root_owner`, so the user can also write at the top of the mounted
+disk. It works with or without `--add` and `--from`:
+
+```powershell
+cargo run -- create --chown 1000:1000 --root-owner 1000:1000 `
+  --add C:\work\app:/home/test output.img
+```
+
+Here `/home`, `/home/test` and everything under `/home/test/app` belong to
+`1000:1000`. With `--from`, an existing `/home` would stay `root:root`. Both
+flags take numeric IDs only, because the user that matters is the one in the
+VM the disk is attached to, not one in an image's `/etc/passwd`. A missing GID
+defaults to the UID.
+
 In library code, initialize the root directory and then call
 `builder.import_host_root(source)`, or use `import_host_directory(parent, source)`
 to create an appropriately named child directory beneath an existing ext4
 directory. Both methods return the imported directory inode. Regular files,
 directories, and symbolic links are imported without following links.
+Call `builder.set_host_owner(Some((uid, gid)))` before importing to get the
+`--chown` behaviour (use `ensure_host_destination(path)` to create destination
+directories with that owner), and `set_inode_owner(EXT4_ROOT_INO, uid, gid)`
+for `--root-owner`.
 
 Use `Ext4ImageBuilder::new_file(size_mib, output)` for file-backed construction.
 `Ext4ImageBuilder::new(size_mib)` remains available when an in-memory image is

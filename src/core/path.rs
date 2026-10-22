@@ -1,7 +1,7 @@
 //! Path resolution inside the image, following symlinks like a chrooted
 //! path walk.
 
-use super::Ext4ImageBuilder;
+use super::{Ext4ImageBuilder, PosixMetadata};
 use crate::ext4::*;
 use anyhow::Result;
 
@@ -115,6 +115,17 @@ impl Ext4ImageBuilder {
     /// non-directories are replaced by an empty directory when
     /// `replace_non_directories` is set, and are an error otherwise.
     pub fn ensure_directory(&mut self, path: &str, replace_non_directories: bool) -> Result<u32> {
+        self.ensure_directory_with(path, replace_non_directories, None)
+    }
+
+    /// Like `ensure_directory`, giving missing components `created` metadata
+    /// instead of the directory defaults.
+    pub(crate) fn ensure_directory_with(
+        &mut self,
+        path: &str,
+        replace_non_directories: bool,
+        created: Option<&PosixMetadata>,
+    ) -> Result<u32> {
         let mut stack = vec![EXT4_ROOT_INO];
         for part in path
             .split('/')
@@ -125,7 +136,7 @@ impl Ext4ImageBuilder {
             }
             let current = *stack.last().expect("the walk always keeps the root");
             let Some(child) = self.lookup_dir_entry(current, part)? else {
-                stack.push(self.mkdir(current, part, None)?);
+                stack.push(self.mkdir(current, part, created)?);
                 continue;
             };
             if self.inode(child).is_dir() {
@@ -149,7 +160,7 @@ impl Ext4ImageBuilder {
                 ));
             }
             self.remove_dir_entry(current, part)?;
-            stack.push(self.mkdir(current, part, None)?);
+            stack.push(self.mkdir(current, part, created)?);
         }
         Ok(*stack.last().expect("the walk always keeps the root"))
     }
@@ -172,7 +183,6 @@ impl Ext4ImageBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::PosixMetadata;
 
     fn builder() -> Result<Ext4ImageBuilder> {
         let mut builder = Ext4ImageBuilder::new(16);

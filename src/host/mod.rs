@@ -138,6 +138,34 @@ impl Ext4ImageBuilder {
         self.import_host_path(parent, source)
     }
 
+    /// Forces `uid:gid` onto every entry imported from the host afterwards,
+    /// independent of the host's own ownership.  `None` restores the default:
+    /// host IDs on Unix and root elsewhere.  Directories created by
+    /// `ensure_host_destination` get the same owner, while existing image
+    /// entries, including directories that a host directory is merged into,
+    /// keep theirs.
+    pub fn set_host_owner(&mut self, owner: Option<(u32, u32)>) {
+        self.host_owner = owner;
+    }
+
+    /// Returns the destination directory for a host import at `path`,
+    /// creating missing components with the host owner, so that, e.g.,
+    /// importing into `/home/user` leaves `user` writable by that owner.
+    pub fn ensure_host_destination(&mut self, path: &str) -> Result<u32> {
+        let created = self
+            .host_owner
+            .map(|_| self.with_host_owner(PosixMetadata::default()));
+        self.ensure_directory_with(path, false, created.as_ref())
+    }
+
+    fn with_host_owner(&self, mut metadata: PosixMetadata) -> PosixMetadata {
+        if let Some((uid, gid)) = self.host_owner {
+            metadata.uid = uid;
+            metadata.gid = gid;
+        }
+        metadata
+    }
+
     /// Imports a regular file, directory, or symbolic link below `parent`.
     /// The imported entry retains its host basename and returns its inode.
     pub fn import_host_path(&mut self, parent: u32, source: impl AsRef<Path>) -> Result<u32> {
@@ -248,7 +276,7 @@ impl Ext4ImageBuilder {
             };
             let metadata =
                 HostMetadata::from_std(&std_metadata, file_type == HostFileType::Directory);
-            let host_meta = metadata.as_posix();
+            let host_meta = self.with_host_owner(metadata.as_posix());
 
             let inode = match file_type {
                 HostFileType::Directory => {
@@ -303,7 +331,7 @@ impl Ext4ImageBuilder {
             })?;
         Self::validate_name(name)?;
         let file_type = metadata.file_type();
-        let host_meta = Self::host_metadata(&metadata, file_type.is_dir());
+        let host_meta = self.with_host_owner(Self::host_metadata(&metadata, file_type.is_dir()));
         if file_type.is_dir() {
             let directory = self.mkdir(parent, name, Some(&host_meta))?;
             self.import_host_directory_contents(directory, source)?;
@@ -346,7 +374,7 @@ impl Ext4ImageBuilder {
                         entry.path.display()
                     )
                 })?;
-            let host_meta = entry.metadata.as_posix();
+            let host_meta = self.with_host_owner(entry.metadata.as_posix());
             let inode = if entry.file_type == HostFileType::Directory {
                 let inode = self.mkdir(parent_inode, name, Some(&host_meta))?;
                 inode
@@ -569,6 +597,122 @@ mod tests {
             builder.groups[group].inode_table[index].i_mode & 0xf000,
             crate::ext4::S_IFREG
         );
+
+        fs::remove_dir_all(base)?;
+        Ok(())
+    }
+
+    fn inode_owner(builder: &Ext4ImageBuilder, inode: u32) -> (u32, u32) {
+        let (group, index) = builder.inode_location(inode);
+        let raw = &builder.groups[group].inode_table[index];
+        let high = |offset: usize| {
+            u32::from(u16::from_le_bytes([
+                raw.i_osd2[offset],
+                raw.i_osd2[offset + 1],
+            ]))
+        };
+        (
+            u32::from({ raw.i_uid }) | high(4) << 16,
+            u32::from({ raw.i_gid }) | high(6) << 16,
+        )
+    }
+
+    #[test]
+    fn host_owner_applies_to_every_import_path() -> Result<()> {
+        let base = std::env::temp_dir().join(format!("ext4kit-chown-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let source = base.join("app");
+        fs::create_dir_all(source.join("src"))?;
+        fs::write(source.join("src").join("main.rs"), b"fn main() {}")?;
+        let owner = (70_000, 80_001);
+
+        let mut builder = Ext4ImageBuilder::new(16);
+        builder.create_root_dir()?;
+        builder.create_lost_and_found()?;
+        builder.reserve_inodes();
+        builder.set_host_owner(Some(owner));
+        let tree = HostTree::scan(&source)?;
+        let imports = [
+            builder.create_directory_path("/tree")?,
+            builder.create_directory_path("/streamed")?,
+            builder.create_directory_path("/recursive")?,
+        ];
+        builder.import_host_tree(imports[0], &tree)?;
+        builder.import_host_path_streaming(imports[1], &source)?;
+        builder.import_host_path(imports[2], &source)?;
+
+        for parent in imports {
+            let app = builder
+                .lookup_dir_entry(parent, "app")?
+                .expect("app imported");
+            let src = builder.lookup_dir_entry(app, "src")?.expect("src imported");
+            let main = builder
+                .lookup_dir_entry(src, "main.rs")?
+                .expect("file imported");
+            for inode in [app, src, main] {
+                assert_eq!(inode_owner(&builder, inode), owner);
+            }
+            // `create_directory_path` ignores the host owner.
+            assert_eq!(inode_owner(&builder, parent), (0, 0));
+        }
+
+        fs::remove_dir_all(base)?;
+        Ok(())
+    }
+
+    #[test]
+    fn host_destination_owns_only_created_directories() -> Result<()> {
+        let mut builder = Ext4ImageBuilder::new(16);
+        builder.create_root_dir()?;
+        builder.create_lost_and_found()?;
+        builder.reserve_inodes();
+        let home = builder.ensure_directory("/home", false)?;
+        let unowned = builder.ensure_host_destination("/srv/app")?;
+        builder.set_host_owner(Some((1000, 1001)));
+        let user = builder.ensure_host_destination("/home/test/src")?;
+
+        assert_eq!(inode_owner(&builder, EXT4_ROOT_INO), (0, 0));
+        assert_eq!(inode_owner(&builder, home), (0, 0));
+        assert_eq!(inode_owner(&builder, unowned), (0, 0));
+        let test = builder
+            .lookup_dir_entry(home, "test")?
+            .expect("test created");
+        assert_eq!(inode_owner(&builder, test), (1000, 1001));
+        assert_eq!(inode_owner(&builder, user), (1000, 1001));
+        assert_eq!(builder.inode(user).i_mode & 0o7777, 0o755);
+        Ok(())
+    }
+
+    #[test]
+    fn host_owner_overlay_keeps_existing_directory_owner() -> Result<()> {
+        let base =
+            std::env::temp_dir().join(format!("ext4kit-chown-overlay-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(base.join("nested"))?;
+        fs::write(base.join("nested").join("child.txt"), b"child")?;
+
+        let mut builder = Ext4ImageBuilder::new(16);
+        builder.create_root_dir()?;
+        builder.create_lost_and_found()?;
+        builder.reserve_inodes();
+        let existing_meta = PosixMetadata {
+            uid: 5,
+            gid: 6,
+            ..Default::default()
+        };
+        let existing = builder.mkdir(EXT4_ROOT_INO, "existing", Some(&existing_meta))?;
+        builder.set_host_owner(Some((1000, 1000)));
+        builder.overlay_host_directory(existing, &base)?;
+
+        let nested = builder
+            .lookup_dir_entry(existing, "nested")?
+            .expect("nested merged");
+        let child = builder
+            .lookup_dir_entry(nested, "child.txt")?
+            .expect("child merged");
+        assert_eq!(inode_owner(&builder, existing), (5, 6));
+        assert_eq!(inode_owner(&builder, nested), (1000, 1000));
+        assert_eq!(inode_owner(&builder, child), (1000, 1000));
 
         fs::remove_dir_all(base)?;
         Ok(())

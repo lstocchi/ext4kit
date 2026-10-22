@@ -39,6 +39,9 @@ pub struct Ext4ImageBuilder {
     /// Cached names and append slots for linear directories only. Indexed
     /// directories deliberately bypass this cache and use htree lookup.
     pub(crate) directory_caches: HashMap<u32, directory::DirectoryCache>,
+    /// UID and GID forced onto every entry imported from the host, like
+    /// `COPY --chown`; `None` keeps the ownership read from the host.
+    pub(crate) host_owner: Option<(u32, u32)>,
 }
 
 /// Mutable image bytes backed either by memory (primarily tests and library
@@ -185,6 +188,7 @@ impl Ext4ImageBuilder {
             next_block_hints: vec![0; block_groups_number],
             next_inode_hints: vec![0; block_groups_number],
             directory_caches: HashMap::new(),
+            host_owner: None,
         };
 
         builder.init_layout();

@@ -133,6 +133,15 @@ impl Ext4ImageBuilder {
         Ok(())
     }
 
+    /// Replaces only an inode's ownership, like chown(2) by root.
+    pub fn set_inode_owner(&mut self, ino: u32, uid: u32, gid: u32) -> Result<()> {
+        if !self.is_inode_allocated(ino) {
+            return Err(anyhow::anyhow!("inode {ino} does not exist"));
+        }
+        Self::populate_inode_owner(self.inode_mut(ino), uid, gid);
+        Ok(())
+    }
+
     /// Parses one directory block, rejecting records that
     /// ext2fs_process_dir_block() treats as EXT2_ET_DIR_CORRUPTED.
     pub(crate) fn dir_block_records(&self, block: u32) -> Result<Vec<DirRecord>> {
@@ -453,6 +462,14 @@ impl Ext4ImageBuilder {
         }
     }
 
+    /// Splits a 32-bit UID and GID across the inode's low and Linux high fields.
+    fn populate_inode_owner(inode: &mut Ext4Inode, uid: u32, gid: u32) {
+        inode.i_uid = uid as u16;
+        inode.i_gid = gid as u16;
+        inode.i_osd2[4..6].copy_from_slice(&((uid >> 16) as u16).to_le_bytes());
+        inode.i_osd2[6..8].copy_from_slice(&((gid >> 16) as u16).to_le_bytes());
+    }
+
     /// Applies POSIX metadata and file-type defaults to an inode; returns no value because it mutates in place.
     pub(crate) fn populate_inode_metadata(
         inode: &mut Ext4Inode,
@@ -462,10 +479,7 @@ impl Ext4ImageBuilder {
     ) {
         let mode = m.mode.map_or(default_perms, |mode| mode & 0o7777);
         inode.i_mode = kind | mode;
-        inode.i_uid = m.uid as u16;
-        inode.i_gid = m.gid as u16;
-        inode.i_osd2[4..6].copy_from_slice(&((m.uid >> 16) as u16).to_le_bytes());
-        inode.i_osd2[6..8].copy_from_slice(&((m.gid >> 16) as u16).to_le_bytes());
+        Self::populate_inode_owner(inode, m.uid, m.gid);
         inode.i_atime = m.atime;
         inode.i_ctime = m.ctime;
         inode.i_mtime = m.mtime;
@@ -1505,5 +1519,26 @@ mod tests {
         assert_eq!(builder.disk_data[root_block + 30], 1);
         let root = builder.read_dx_entries(directory).unwrap();
         assert_eq!(root, vec![(0, 4)]);
+    }
+
+    #[test]
+    fn set_inode_owner_changes_only_ownership() -> Result<()> {
+        let mut builder = fresh_builder()?;
+        let metadata = PosixMetadata {
+            mode: Some(0o700),
+            mtime: 1_700_000_000,
+            ..Default::default()
+        };
+        let dir = builder.mkdir(EXT4_ROOT_INO, "dir", Some(&metadata))?;
+        builder.set_inode_owner(dir, 70_000, 80_000)?;
+
+        let inode = builder.inode(dir);
+        assert_eq!({ inode.i_uid }, 70_000u32 as u16);
+        assert_eq!({ inode.i_gid }, 80_000u32 as u16);
+        assert_eq!(&inode.i_osd2[4..8], &[1, 0, 1, 0]);
+        assert_eq!(inode.i_mode & 0o7777, 0o700);
+        assert_eq!({ inode.i_mtime }, 1_700_000_000);
+        assert!(builder.set_inode_owner(9999, 0, 0).is_err());
+        Ok(())
     }
 }

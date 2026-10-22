@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use ext4kit::{
     core::Ext4ImageBuilder,
+    ext4::EXT4_ROOT_INO,
     host::HostTree,
     oci::{
         image_size_mib,
@@ -46,6 +47,21 @@ enum Command {
         /// overrides the base-image estimate.
         #[arg(long, value_name = "MIB")]
         size: Option<usize>,
+
+        /// Numeric owner for everything imported with --add and for the
+        /// destination directories created for it, as in a Dockerfile
+        /// `COPY --chown`. A missing GID defaults to the UID. Entries from
+        /// --from keep their image ownership.
+        /// Example: --chown 1000:1000
+        #[arg(long, value_name = "UID[:GID]", value_parser = parse_owner, requires = "add")]
+        chown: Option<(u32, u32)>,
+
+        /// Numeric owner of the filesystem root directory, like
+        /// `mke2fs -E root_owner`, so a user can write at the top of the
+        /// mounted disk. A missing GID defaults to the UID.
+        /// Example: --root-owner 1000:1000
+        #[arg(long, value_name = "UID[:GID]", value_parser = parse_owner)]
+        root_owner: Option<(u32, u32)>,
     },
 }
 
@@ -56,6 +72,8 @@ fn main() -> anyhow::Result<()> {
         from,
         output,
         size,
+        chown,
+        root_owner,
     } = cli.command;
     let additions: Vec<Addition> = add
         .iter()
@@ -111,6 +129,7 @@ fn main() -> anyhow::Result<()> {
     builder.create_root_dir()?;
     builder.create_lost_and_found()?;
     builder.reserve_inodes();
+    builder.set_host_owner(chown);
 
     if let Some((runtime, source)) = &base {
         match source {
@@ -131,7 +150,7 @@ fn main() -> anyhow::Result<()> {
     import_order.sort_by_key(|&index| additions[index].target().matches('/').count());
     for index in import_order {
         let addition = &additions[index];
-        let destination_parent = builder.ensure_directory(&addition.destination, false)?;
+        let destination_parent = builder.ensure_host_destination(&addition.destination)?;
         let name = addition.name();
         let existing = builder.lookup_dir_entry(destination_parent, name)?;
         match existing {
@@ -147,6 +166,11 @@ fn main() -> anyhow::Result<()> {
                 }
             }
         }
+    }
+
+    // Applied last so a root entry in a --from layer cannot override it.
+    if let Some((uid, gid)) = root_owner {
+        builder.set_inode_owner(EXT4_ROOT_INO, uid, gid)?;
     }
 
     builder.write_to_file(output.to_str().ok_or_else(|| {
@@ -311,6 +335,24 @@ fn parse_add(add: &str) -> anyhow::Result<Addition> {
     }
 }
 
+/// Parses a `--chown` or `--root-owner` `UID[:GID]`. Only numeric IDs are accepted: the host has no
+/// account database for the guest, and names in a --from image's /etc/passwd
+/// need not match the users of the VM the image is attached to.
+fn parse_owner(value: &str) -> Result<(u32, u32), String> {
+    let parse_id = |id: &str, kind: &str| {
+        id.parse::<u32>()
+            .map_err(|_| format!("{kind} must be a number from 0 to 4294967295, got {id:?}"))
+    };
+    let (uid, gid) = match value.split_once(':') {
+        Some((uid, gid)) => (parse_id(uid, "UID")?, parse_id(gid, "GID")?),
+        None => {
+            let uid = parse_id(value, "UID")?;
+            (uid, uid)
+        }
+    };
+    Ok((uid, gid))
+}
+
 /// Rejects filesystem roots, which have no name to place in the image.
 fn validate_add_source(source: &Path) -> anyhow::Result<()> {
     match source.file_name().and_then(|name| name.to_str()) {
@@ -403,7 +445,8 @@ fn reject_target_collisions(
 mod tests {
     use super::{
         Addition, Cli, Command, RequestedTransport, destination_directories, local_image_size_mib,
-        output_image_size_mib, parse_add, reject_target_collisions, requested_transport,
+        output_image_size_mib, parse_add, parse_owner, reject_target_collisions,
+        requested_transport,
     };
     use clap::Parser;
     use ext4kit::oci::local::Engine;
@@ -423,6 +466,65 @@ mod tests {
         .unwrap();
         let Command::Create { size, .. } = cli.command;
         assert_eq!(size, Some(3200));
+    }
+
+    #[test]
+    fn owner_accepts_numeric_uid_and_optional_gid() {
+        assert_eq!(parse_owner("1000:1001"), Ok((1000, 1001)));
+        assert_eq!(parse_owner("1000"), Ok((1000, 1000)));
+        assert_eq!(parse_owner("0:4294967295"), Ok((0, u32::MAX)));
+        assert!(parse_owner("test").is_err());
+        assert!(parse_owner("1000:").is_err());
+        assert!(parse_owner(":1000").is_err());
+        assert!(parse_owner("-1").is_err());
+        assert!(parse_owner("4294967296").is_err());
+    }
+
+    #[test]
+    fn chown_requires_host_additions() {
+        let error = Cli::try_parse_from([
+            "ext4kit",
+            "create",
+            "--from",
+            "alpine:latest",
+            "--chown",
+            "1000",
+            "output.img",
+        ])
+        .unwrap_err();
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+
+        let cli = Cli::try_parse_from([
+            "ext4kit",
+            "create",
+            "--add",
+            "source",
+            "--chown",
+            "1000:1000",
+            "output.img",
+        ])
+        .unwrap();
+        let Command::Create { chown, .. } = cli.command;
+        assert_eq!(chown, Some((1000, 1000)));
+    }
+
+    #[test]
+    fn root_owner_is_accepted_without_host_additions() {
+        let cli = Cli::try_parse_from([
+            "ext4kit",
+            "create",
+            "--from",
+            "alpine:latest",
+            "--root-owner",
+            "1000",
+            "output.img",
+        ])
+        .unwrap();
+        let Command::Create { root_owner, .. } = cli.command;
+        assert_eq!(root_owner, Some((1000, 1000)));
     }
 
     #[test]
