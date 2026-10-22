@@ -149,7 +149,7 @@ fn xattr_entry_hash(name: &[u8], value: &[u8]) -> u32 {
 /// Converts a Linux POSIX ACL xattr to ext4's compact disk encoding; returns encoded bytes.
 pub(crate) fn posix_acl_to_ext4_disk(value: &[u8]) -> Result<Vec<u8>> {
     if value.len() < 12
-        || (value.len() - 4) % 8 != 0
+        || !(value.len() - 4).is_multiple_of(8)
         || u32::from_le_bytes(value[..4].try_into().unwrap()) != 2
     {
         return Err(anyhow::anyhow!("invalid POSIX ACL xattr payload"));

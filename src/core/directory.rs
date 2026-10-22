@@ -536,11 +536,13 @@ impl Ext4ImageBuilder {
         self.disk_data[data_block as usize * BLOCK_SIZE..(data_block as usize + 1) * BLOCK_SIZE]
             .copy_from_slice(&block);
 
-        let mut inode = Ext4Inode::default();
-        inode.i_size_lo = BLOCK_SIZE as u32;
-        inode.i_links_count = 2;
-        inode.i_blocks_lo = (BLOCK_SIZE / 512) as u32;
-        inode.i_flags = EXT4_EXTENTS_FL;
+        let mut inode = Ext4Inode {
+            i_size_lo: BLOCK_SIZE as u32,
+            i_links_count: 2,
+            i_blocks_lo: (BLOCK_SIZE / 512) as u32,
+            i_flags: EXT4_EXTENTS_FL,
+            ..Default::default()
+        };
 
         Self::populate_inode_metadata(&mut inode, meta, S_IFDIR, 0o755);
         Self::init_single_extent(&mut inode, 1, data_block);
@@ -768,12 +770,12 @@ impl Ext4ImageBuilder {
 
         // If the last extent is contiguous with the new block, merge them
         let mut merged = false;
-        if let Some(last) = leaf_extents.last_mut() {
-            if last.ee_start_lo + (last.ee_len as u32) == new_blk && (last.ee_len as usize) < 32768
-            {
-                last.ee_len += 1;
-                merged = true;
-            }
+        if let Some(last) = leaf_extents.last_mut()
+            && last.ee_start_lo + (last.ee_len as u32) == new_blk
+            && (last.ee_len as usize) < 32768
+        {
+            last.ee_len += 1;
+            merged = true;
         }
         if !merged {
             let current_size = self.groups[group].inode_table[index_in_group].i_size_lo;
@@ -1196,7 +1198,7 @@ mod tests {
         let dev_old = u32::from_le_bytes(blk.i_block[..4].try_into().unwrap());
         let dev_new = u32::from_le_bytes(blk.i_block[4..8].try_into().unwrap());
         assert_eq!(dev_old, 0);
-        let expected_new = (1 & 0xff) | (259 << 8) | ((1 & !0xff) << 12);
+        let expected_new = (1 & 0xff) | (259 << 8);
         assert_eq!(dev_new, expected_new);
     }
 

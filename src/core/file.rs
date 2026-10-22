@@ -52,7 +52,7 @@ impl Ext4ImageBuilder {
         // it ensures that the group has enough capacity to allocate the new inode
         let dir_growth_blocks = self.estimate_dir_expansion_blocks(parent, name)?;
         self.ensure_allocation_capacity(
-            file_blocks_needed as u32 + dir_growth_blocks,
+            file_blocks_needed + dir_growth_blocks,
             metadata_blocks_required,
         )?;
 

@@ -290,14 +290,8 @@ impl Ext4ImageBuilder {
                 HostFileType::File => {
                     let file = fs::File::open(&path)
                         .with_context(|| format!("cannot open host file {}", path.display()))?;
-                    let inode = self.add_file_from_reader(
-                        parent_inode,
-                        name,
-                        file,
-                        metadata.size,
-                        &host_meta,
-                    )?;
-                    inode
+
+                    self.add_file_from_reader(parent_inode, name, file, metadata.size, &host_meta)?
                 }
                 HostFileType::Symlink => {
                     let target = fs::read_link(&path)
@@ -376,19 +370,18 @@ impl Ext4ImageBuilder {
                 })?;
             let host_meta = self.with_host_owner(entry.metadata.as_posix());
             let inode = if entry.file_type == HostFileType::Directory {
-                let inode = self.mkdir(parent_inode, name, Some(&host_meta))?;
-                inode
+                self.mkdir(parent_inode, name, Some(&host_meta))?
             } else if entry.file_type == HostFileType::File {
                 let file = fs::File::open(&entry.path)
                     .with_context(|| format!("cannot open host file {}", entry.path.display()))?;
-                let inode = self.add_file_from_reader(
+
+                self.add_file_from_reader(
                     parent_inode,
                     name,
                     file,
                     entry.metadata.size,
                     &host_meta,
-                )?;
-                inode
+                )?
             } else {
                 self.add_symlink(
                     parent_inode,
@@ -612,8 +605,8 @@ mod tests {
             ]))
         };
         (
-            u32::from({ raw.i_uid }) | high(4) << 16,
-            u32::from({ raw.i_gid }) | high(6) << 16,
+            u32::from(raw.i_uid) | high(4) << 16,
+            u32::from(raw.i_gid) | high(6) << 16,
         )
     }
 

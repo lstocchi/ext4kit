@@ -226,15 +226,14 @@ impl Ext4ImageBuilder {
     /// Marks one inode allocated and updates accounting; returns no value.
     pub(crate) fn mark_inode_used(&mut self, inode: u32) {
         let (group, index_in_group) = self.inode_location(inode);
-        let byte_idx = (index_in_group / 8) as usize;
+        let byte_idx = index_in_group / 8;
         let bit_idx = index_in_group % 8;
 
         self.groups[group].inode_bitmap[byte_idx] |= 1 << bit_idx;
         self.groups[group].free_inodes_count -= 1;
         self.group_descriptors[group].bg_free_inodes_count_lo -= 1;
         self.superblock.s_free_inodes_count -= 1;
-        self.next_inode_hints[group] =
-            self.next_inode_hints[group].max(index_in_group as usize + 1);
+        self.next_inode_hints[group] = self.next_inode_hints[group].max(index_in_group + 1);
     }
 
     /// Releases an allocated inode and restores its allocation accounting.
@@ -536,14 +535,16 @@ impl Ext4ImageBuilder {
         self.disk_data[disk_offset..disk_offset + BLOCK_SIZE].copy_from_slice(&dir_block);
 
         // Create Root Inode (Inode #2, index 1 in group 0's inode_table)
-        let mut root_inode = Ext4Inode::default();
-        root_inode.i_mode = S_IFDIR | 0o755;
-        root_inode.i_uid = 0;
-        root_inode.i_gid = 0;
-        root_inode.i_size_lo = BLOCK_SIZE as u32;
-        root_inode.i_links_count = 2;
-        root_inode.i_blocks_lo = BLOCK_SIZE as u32 / 512;
-        root_inode.i_flags = EXT4_EXTENTS_FL;
+        let mut root_inode = Ext4Inode {
+            i_mode: S_IFDIR | 0o755,
+            i_uid: 0,
+            i_gid: 0,
+            i_size_lo: BLOCK_SIZE as u32,
+            i_links_count: 2,
+            i_blocks_lo: BLOCK_SIZE as u32 / 512,
+            i_flags: EXT4_EXTENTS_FL,
+            ..Default::default()
+        };
 
         // Extent Header for root inode
         let header = Ext4ExtentHeader {
@@ -629,14 +630,16 @@ impl Ext4ImageBuilder {
             self.disk_data[disk_offset..disk_offset + BLOCK_SIZE].copy_from_slice(&empty_dir_block);
         }
 
-        let mut lpf_inode = Ext4Inode::default();
-        lpf_inode.i_mode = S_IFDIR | 0o700; // Restricted perms (drwx------)
-        lpf_inode.i_uid = 0;
-        lpf_inode.i_gid = 0;
-        lpf_inode.i_size_lo = (allocated_blocks.len() * BLOCK_SIZE) as u32; // 16KB total size
-        lpf_inode.i_links_count = 2;
-        lpf_inode.i_blocks_lo = (allocated_blocks.len() * 8) as u32; // 8 = BLOCK_SIZE / 512
-        lpf_inode.i_flags = EXT4_EXTENTS_FL;
+        let mut lpf_inode = Ext4Inode {
+            i_mode: S_IFDIR | 0o700, // Restricted perms (drwx------)
+            i_uid: 0,
+            i_gid: 0,
+            i_size_lo: (allocated_blocks.len() * BLOCK_SIZE) as u32, // 16KB total size
+            i_links_count: 2,
+            i_blocks_lo: (allocated_blocks.len() * 8) as u32, // 8 = BLOCK_SIZE / 512
+            i_flags: EXT4_EXTENTS_FL,
+            ..Default::default()
+        };
 
         let header = Ext4ExtentHeader {
             eh_magic: EXT4_EH_MAGIC,

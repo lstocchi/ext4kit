@@ -35,10 +35,10 @@ impl Ext4ImageBuilder {
             return false;
         }
         let (group, index_in_group) = self.inode_location(ino);
-        let byte_idx = (index_in_group / 8) as usize;
+        let byte_idx = index_in_group / 8;
         let bit_idx = index_in_group % 8;
 
-        self.groups[group as usize].inode_bitmap[byte_idx] & (1 << bit_idx) != 0
+        self.groups[group].inode_bitmap[byte_idx] & (1 << bit_idx) != 0
     }
 
     /// Finds a free inode near `parent_dir_ino`, probing from the group's

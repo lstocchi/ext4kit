@@ -1,6 +1,9 @@
 //! Extracted core filesystem operations.
 
-use super::{Ext4ImageBuilder, directory::PosixMetadata};
+use super::{
+    Ext4ImageBuilder,
+    directory::{PosixMetadata, default_permissions, dir_entry_file_type},
+};
 use crate::ext4::*;
 use crate::xattr::prepare_xattrs;
 use anyhow::Result;
@@ -14,12 +17,15 @@ impl Ext4ImageBuilder {
         parent: u32,
         name: &str,
         kind: u16,
-        default_perms: u16,
-        dir_file_type: u8,
         i_block_payload: [u8; 60],
         meta: &PosixMetadata,
     ) -> Result<u32> {
         Self::validate_name(name)?;
+        let (Some(default_perms), Some(dir_file_type)) =
+            (default_permissions(kind), dir_entry_file_type(kind))
+        else {
+            anyhow::bail!("unsupported special file type {kind:#o}");
+        };
         let expansion_blocks = self.estimate_dir_expansion_blocks(parent, name)?;
 
         let xattrs = prepare_xattrs(&meta.xattrs)?;
@@ -60,7 +66,7 @@ impl Ext4ImageBuilder {
         meta: &PosixMetadata,
     ) -> Result<u32> {
         let payload = Self::encode_device_number(major, minor)?;
-        self.add_special_file(parent, name, S_IFCHR, 0o660, EXT4_FT_CHRDEV, payload, meta)
+        self.add_special_file(parent, name, S_IFCHR, payload, meta)
     }
 
     /// Creates a block-device node and returns its inode number (e.g. /dev/sda).
@@ -73,17 +79,17 @@ impl Ext4ImageBuilder {
         meta: &PosixMetadata,
     ) -> Result<u32> {
         let payload = Self::encode_device_number(major, minor)?;
-        self.add_special_file(parent, name, S_IFBLK, 0o660, EXT4_FT_BLKDEV, payload, meta)
+        self.add_special_file(parent, name, S_IFBLK, payload, meta)
     }
 
     /// Creates a FIFO/named pipe and returns its inode number.
     pub fn add_fifo(&mut self, parent: u32, name: &str, meta: &PosixMetadata) -> Result<u32> {
-        self.add_special_file(parent, name, S_IFIFO, 0o644, EXT4_FT_FIFO, [0u8; 60], meta)
+        self.add_special_file(parent, name, S_IFIFO, [0u8; 60], meta)
     }
 
     /// Creates a Unix-domain socket node and returns its inode number.
     pub fn add_socket(&mut self, parent: u32, name: &str, meta: &PosixMetadata) -> Result<u32> {
-        self.add_special_file(parent, name, S_IFSOCK, 0o777, EXT4_FT_SOCK, [0u8; 60], meta)
+        self.add_special_file(parent, name, S_IFSOCK, [0u8; 60], meta)
     }
 
     /// Encodes device major/minor numbers into the 60-byte `i_block` payload
@@ -97,7 +103,7 @@ impl Ext4ImageBuilder {
         }
         let mut block = [0u8; 60];
         if major < 256 && minor < 256 {
-            let old_dev = ((major << 8) | minor) as u32;
+            let old_dev = (major << 8) | minor;
             block[..4].copy_from_slice(&old_dev.to_le_bytes());
         } else {
             let new_dev = (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12);
