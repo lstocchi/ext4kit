@@ -59,7 +59,12 @@ Xattr keys use fully qualified Linux names such as `user.comment`,
 Regular files and directories may span fragmented runs. Extent-tree metadata
 is added automatically when extents do not fit in the inode. Directory growth
 reserves its data and required extent-tree blocks before creating a child, and
-reclaims replaced extent-tree blocks.
+reclaims replaced extent-tree blocks. Directories that outgrow their first
+block are converted to hashed (dx) indexes. `lost+found` is created as a
+multi-block linear directory, as mke2fs writes it, and is not converted: once
+its four blocks are full, adding to it fails with an error. How many entries
+fit depends on name length, from about 1,000 short names down to about 60
+names of 255 bytes.
 
 Symlink targets may be empty and may contain at most `BLOCK_SIZE - 1` bytes
 (4,095 bytes with 4 KiB blocks). Targets under 60 bytes are inline; longer

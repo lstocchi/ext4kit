@@ -62,7 +62,10 @@ impl Ext4ImageBuilder {
             // Note: e2fsprogs attempts inline_data here if the feature is enabled.
             // Since this builder currently do not have inline_data support, we route
             // directly to the slow block-allocated fallback.
-            let data_block = self.allocate_free_blocks(group, 1)?;
+            let data_block = match self.allocate_free_blocks(group, 1) {
+                Ok(block) => block,
+                Err(error) => return Err(self.rollback_created_runs(ino, &[], error)),
+            };
             let offset = data_block as usize * BLOCK_SIZE;
             // The e2fsprogs buffer is zero-initialized before copying the
             // target, which supplies the NUL terminator and a zero-filled tail.
@@ -73,13 +76,20 @@ impl Ext4ImageBuilder {
             Self::init_single_extent(&mut inode, 1, data_block);
         }
 
+        // From here on the inode entry describes every block it owns.
+        self.groups[group].inode_table[index_in_group] = inode;
         if !xattrs.is_empty() {
-            inode.i_file_acl_lo = self.write_prepared_xattr_block(group, &xattrs)?;
+            inode.i_file_acl_lo = match self.write_prepared_xattr_block(group, &xattrs) {
+                Ok(block) => block,
+                Err(error) => return Err(self.rollback_created_inode(ino, error)),
+            };
             inode.i_blocks_lo += (BLOCK_SIZE / 512) as u32;
         }
 
         self.groups[group].inode_table[index_in_group] = inode;
-        self.add_dir_entry(parent, name, ino, EXT4_FT_SYMLINK)?;
+        if let Err(error) = self.add_dir_entry(parent, name, ino, EXT4_FT_SYMLINK) {
+            return Err(self.rollback_created_inode(ino, error));
+        }
 
         Ok(ino)
     }

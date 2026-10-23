@@ -48,12 +48,17 @@ impl Ext4ImageBuilder {
         inode.i_block = i_block_payload;
 
         if !xattrs.is_empty() {
-            inode.i_file_acl_lo = self.write_prepared_xattr_block(group, &xattrs)?;
+            inode.i_file_acl_lo = match self.write_prepared_xattr_block(group, &xattrs) {
+                Ok(block) => block,
+                Err(error) => return Err(self.rollback_created_runs(ino, &[], error)),
+            };
             inode.i_blocks_lo += (BLOCK_SIZE / 512) as u32;
         }
 
         self.groups[group].inode_table[index_in_group] = inode;
-        self.add_dir_entry(parent, name, ino, dir_file_type)?;
+        if let Err(error) = self.add_dir_entry(parent, name, ino, dir_file_type) {
+            return Err(self.rollback_created_inode(ino, error));
+        }
         Ok(ino)
     }
 

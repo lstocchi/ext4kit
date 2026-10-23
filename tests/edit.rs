@@ -232,6 +232,40 @@ fn failed_edits_report_errors_and_leave_a_clean_image() {
 }
 
 #[test]
+fn filling_lost_and_found_leaves_a_clean_image() {
+    // lost+found is the only multi-block linear directory.  Filling it past
+    // its ~1022-record capacity used to commit the overflowing file before
+    // add_dir_entry failed, so the image saved despite the error carried an
+    // unattached inode that e2fsck reported.  The directory-growth preflight
+    // now rejects the add before anything is committed, so this test does
+    // not reach rollback_created_inode; unit tests cover that path.
+    let (tmp, img) = rootfs_image();
+    let lost = tmp.path().join("lost+found");
+    fs::create_dir(&lost).unwrap();
+    for i in 0..2000 {
+        fs::write(lost.join(format!("f{i:04}")), b"").unwrap();
+    }
+
+    let output = edit_output(&img, &["add", &arg(&lost)]);
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(
+        stderr.contains("multi-block linear directory"),
+        "stderr: {stderr}"
+    );
+
+    // `edit` saves the image even after a failed action, so the failed add
+    // must have left every bitmap and free count untouched.
+    let Some(image) = Image::check(&img) else {
+        return;
+    };
+    assert!(
+        image.list("/lost+found").len() > 1000,
+        "the entries added before the failure must survive"
+    );
+}
+
+#[test]
 fn cat_and_test_work_on_a_read_only_image() {
     let (_tmp, img) = rootfs_image();
     let mut permissions = fs::metadata(&img).unwrap().permissions();

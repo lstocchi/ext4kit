@@ -89,21 +89,35 @@ impl Ext4ImageBuilder {
         inode.i_links_count = 1;
         inode.i_flags = EXT4_EXTENTS_FL;
 
-        let tree_meta_blocks = self.write_extent_tree(group, &mut inode, &leaf_extents)?;
+        // A failed write_extent_tree releases its own blocks, and no inode
+        // entry describes the data runs yet, so release them explicitly.
+        let tree_meta_blocks = match self.write_extent_tree(group, &mut inode, &leaf_extents) {
+            Ok(blocks) => blocks,
+            Err(error) => {
+                return Err(self.rollback_created_runs(file_inode, &target_block_ranges, error));
+            }
+        };
 
         // Total 512-byte sectors: data + tree metadata blocks
         let mut total_sectors =
             (file_blocks_needed as u64 + tree_meta_blocks as u64) * (BLOCK_SIZE as u64 / 512);
 
+        // From here on the inode entry describes every block it owns.
+        self.groups[group].inode_table[index_in_group] = inode;
         if !xattrs.is_empty() {
-            inode.i_file_acl_lo = self.write_prepared_xattr_block(group, &xattrs)?;
+            inode.i_file_acl_lo = match self.write_prepared_xattr_block(group, &xattrs) {
+                Ok(block) => block,
+                Err(error) => return Err(self.rollback_created_inode(file_inode, error)),
+            };
             total_sectors += BLOCK_SIZE as u64 / 512;
         }
 
         set_block_sectors(&mut inode, total_sectors);
 
         self.groups[group].inode_table[index_in_group] = inode;
-        self.add_dir_entry(parent, name, file_inode, EXT4_FT_REG_FILE)?;
+        if let Err(error) = self.add_dir_entry(parent, name, file_inode, EXT4_FT_REG_FILE) {
+            return Err(self.rollback_created_inode(file_inode, error));
+        }
 
         Ok(file_inode)
     }

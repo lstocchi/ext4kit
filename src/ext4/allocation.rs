@@ -106,6 +106,44 @@ impl Ext4ImageBuilder {
         Ok(())
     }
 
+    /// Undoes a fully committed but never linked creation: releases every
+    /// block the inode owns (data, extent-tree metadata, xattr block) and
+    /// the inode itself, restoring bitmaps and free counts to the state
+    /// before the creation.  For the post-commit failure paths of the file,
+    /// symlink and special-file creators, which commit first and link
+    /// second; `mkdir` rolls back inline.  The inode-table entry must
+    /// describe every block the inode owns.  Returns `error`, with a failed
+    /// rollback attached as context so the original cause is never lost.
+    pub(crate) fn rollback_created_inode(
+        &mut self,
+        ino: u32,
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        let (group, index) = self.inode_location(ino);
+        match self.inode_storage_runs(&self.groups[group].inode_table[index]) {
+            Ok(runs) => self.rollback_created_runs(ino, &runs, error),
+            Err(rollback) => rollback_failed(error, ino, rollback),
+        }
+    }
+
+    /// Like [`Self::rollback_created_inode`], for a creation whose inode-table
+    /// entry does not describe its blocks yet: releases `runs` and `ino`.
+    pub(crate) fn rollback_created_runs(
+        &mut self,
+        ino: u32,
+        runs: &[(u32, u32)],
+        error: anyhow::Error,
+    ) -> anyhow::Error {
+        let rollback = runs
+            .iter()
+            .try_for_each(|&(start, len)| self.release_blocks(start, len))
+            .and_then(|()| self.release_inode(ino));
+        match rollback {
+            Ok(()) => error,
+            Err(rollback) => rollback_failed(error, ino, rollback),
+        }
+    }
+
     /// Reserves a contiguous extent near `preferred_group`, beginning at the
     /// group's allocation cursor and wrapping to reclaimed blocks if needed.
     pub(crate) fn allocate_free_blocks(
@@ -351,6 +389,12 @@ fn find_next_free_bit(bitmap: &[u8], start: usize, end: usize) -> Option<usize> 
         bit += 1;
     }
     None
+}
+
+/// Keeps `error` as the reported cause and attaches the rollback failure,
+/// which leaves the image inconsistent, as context.
+fn rollback_failed(error: anyhow::Error, ino: u32, rollback: anyhow::Error) -> anyhow::Error {
+    error.context(format!("rollback of inode {ino} also failed: {rollback:#}"))
 }
 
 #[cfg(test)]

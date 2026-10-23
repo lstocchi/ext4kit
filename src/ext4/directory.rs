@@ -702,9 +702,18 @@ impl Ext4ImageBuilder {
                 let data_blocks: u32 = if self.dir_is_indexed(parent)? {
                     self.htree_growth_blocks(parent, name)?
                 } else {
-                    // When a directory gets full and needs to grow, it is converted into an htree.
-                    // The original block becomes the index root, and its
-                    // entries are split across 2 newly allocated leaf blocks.
+                    // When a single-block linear directory gets full, it is
+                    // converted into an htree: the original block becomes the
+                    // index root, and its entries are split across 2 newly
+                    // allocated leaf blocks.  A multi-block linear directory
+                    // (only `lost+found` gets that layout) cannot grow, so
+                    // fail here, before anything is committed.
+                    if self.get_dir_blocks(parent)?.len() != 1 {
+                        anyhow::bail!(
+                            "directory inode {parent} is full and cannot grow: \
+                             cannot convert a multi-block linear directory to htree"
+                        );
+                    }
                     2
                 };
                 let tree_blocks =
@@ -791,6 +800,63 @@ mod tests {
         let links = builder.groups[0].inode_table[1].i_links_count;
         assert_eq!(mode, S_IFDIR | 0o750);
         assert_eq!(links, 4);
+    }
+
+    #[test]
+    fn filling_lost_and_found_fails_before_anything_is_committed() -> Result<()> {
+        let mut builder = fresh_builder()?;
+        let lost = builder
+            .lookup_dir_entry(EXT4_ROOT_INO, "lost+found")?
+            .expect("lost+found exists");
+        // lost+found is the only multi-block linear directory ext4kit
+        // creates; about a thousand short records fill its four blocks.
+        let meta = PosixMetadata::default();
+        let mut added = 0;
+        while builder
+            .add_file(lost, &format!("f{added:04}"), b"", &meta)
+            .is_ok()
+        {
+            added += 1;
+        }
+        assert!(added > 1000, "lost+found held only {added} entries");
+
+        let free_blocks = builder.superblock.s_free_blocks_count_lo;
+        let free_inodes = builder.superblock.s_free_inodes_count;
+        let error = builder
+            .add_file(lost, "overflow", b"payload", &meta)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("multi-block linear directory"),
+            "{error}"
+        );
+        assert_eq!({ builder.superblock.s_free_blocks_count_lo }, free_blocks);
+        assert_eq!({ builder.superblock.s_free_inodes_count }, free_inodes);
+        assert_eq!(builder.lookup_dir_entry(lost, "overflow")?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_created_inode_restores_the_pre_creation_state() -> Result<()> {
+        let mut builder = fresh_builder()?;
+        let free_blocks = builder.superblock.s_free_blocks_count_lo;
+        let free_inodes = builder.superblock.s_free_inodes_count;
+        let mut meta = PosixMetadata::default();
+        meta.xattrs.insert("user.note".into(), b"note".to_vec());
+        let ino = builder.add_file(EXT4_ROOT_INO, "file", &[1; BLOCK_SIZE * 2], &meta)?;
+
+        // Leave the committed inode in the state a failed add_dir_entry
+        // would: the record gone, but the inode and its blocks still held.
+        let (block, record) = builder
+            .find_dir_record(EXT4_ROOT_INO, "file")?
+            .expect("the file is linked");
+        builder.unlink_record(EXT4_ROOT_INO, block, record.offset)?;
+        let error = builder.rollback_created_inode(ino, anyhow::anyhow!("link failed"));
+
+        assert_eq!(format!("{error:#}"), "link failed");
+        assert_eq!({ builder.superblock.s_free_blocks_count_lo }, free_blocks);
+        assert_eq!({ builder.superblock.s_free_inodes_count }, free_inodes);
+        assert!(!builder.is_inode_allocated(ino));
+        Ok(())
     }
 
     #[test]

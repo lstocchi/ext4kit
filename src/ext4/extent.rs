@@ -162,6 +162,24 @@ impl Ext4ImageBuilder {
         total_metadata_blocks
     }
 
+    /// Allocates one extent-tree block and records it in `allocated`; on
+    /// failure releases every block recorded so far.
+    fn allocate_tree_block(&mut self, group: usize, allocated: &mut Vec<u32>) -> Result<u32> {
+        match self.allocate_free_blocks(group, 1) {
+            Ok(block) => {
+                allocated.push(block);
+                Ok(block)
+            }
+            Err(error) => {
+                for &block in allocated.iter() {
+                    self.release_block(block)
+                        .expect("extent-tree block was allocated by this call");
+                }
+                Err(error)
+            }
+        }
+    }
+
     /// Serializes an extent tree into the inode and external blocks.
     /// Returns the number of external tree metadata blocks allocated.
     /// Serializes an inode's extent tree; returns the number of external tree blocks allocated.
@@ -188,13 +206,15 @@ impl Ext4ImageBuilder {
             return Ok(0);
         }
 
-        // Depth >= 1: Build bottom-up
+        // Depth >= 1: Build bottom-up.  A failed allocation releases the
+        // tree blocks already taken, so the call allocates all or nothing.
+        let mut allocated = Vec::new();
         let mut metadata_blocks_count = 0u32;
         let mut current_indices = Vec::new();
 
         // Level 0: External leaf blocks containing Ext4Extent
         for chunk in leaf_extents.chunks(EXT4_EXTENTS_PER_BLOCK) {
-            let meta_blk = self.allocate_free_blocks(preferred_group, 1)?;
+            let meta_blk = self.allocate_tree_block(preferred_group, &mut allocated)?;
             metadata_blocks_count += 1;
 
             let mut block_data = vec![0u8; BLOCK_SIZE];
@@ -228,7 +248,7 @@ impl Ext4ImageBuilder {
         while current_indices.len() > EXT4_EXTENTS_IN_INODE {
             let mut next_level_indices = Vec::new();
             for chunk in current_indices.chunks(EXT4_INDEXES_PER_BLOCK) {
-                let meta_blk = self.allocate_free_blocks(preferred_group, 1)?;
+                let meta_blk = self.allocate_tree_block(preferred_group, &mut allocated)?;
                 metadata_blocks_count += 1;
 
                 let mut block_data = vec![0u8; BLOCK_SIZE];
@@ -304,6 +324,28 @@ mod tests {
     use super::*;
     use crate::ext4::PosixMetadata;
     use crate::ext4::test_support::fresh_builder;
+
+    #[test]
+    fn failed_extent_tree_write_releases_its_blocks() -> Result<()> {
+        let mut builder = fresh_builder()?;
+        // Leave room for one of the two leaf blocks the tree needs.
+        while builder.superblock.s_free_blocks_count_lo > 1 {
+            builder.allocate_free_blocks(0, 1)?;
+        }
+        let extents: Vec<Ext4Extent> = (0..=EXT4_EXTENTS_PER_BLOCK as u32)
+            .map(|i| Ext4Extent {
+                ee_block: i,
+                ee_len: 1,
+                ee_start_hi: 0,
+                ee_start_lo: 100 + 2 * i,
+            })
+            .collect();
+
+        let mut inode = Ext4Inode::default();
+        assert!(builder.write_extent_tree(0, &mut inode, &extents).is_err());
+        assert_eq!({ builder.superblock.s_free_blocks_count_lo }, 1);
+        Ok(())
+    }
 
     #[test]
     fn multi_extent_tree_depth_1_verification() {
