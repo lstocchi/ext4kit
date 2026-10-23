@@ -86,6 +86,47 @@ fn host_tree_with_explicit_size_is_clean() {
 }
 
 #[test]
+fn explicit_size_with_an_undersized_trailing_group_is_clean() {
+    // 129 MiB is 33,024 blocks: the 256-block trailing group cannot hold its
+    // backup superblock, bitmaps and inode table, so the filesystem is
+    // planned as a single full 128 MiB group and the image's tail blocks
+    // stay unused. This size used to underflow the free-block counters.
+    let tmp = TempDir::new().unwrap();
+    sample_tree(&tmp.path().join("src"));
+    let out = tmp.path().join("out.img");
+    create(
+        &[
+            "--size",
+            "129",
+            "--add",
+            &format!("{}:/opt", arg(&tmp.path().join("src/app"))),
+        ],
+        &out,
+    );
+    // Reopening must accept a filesystem that ends before the image does.
+    let edited = ext4kit(&["edit", &arg(&out), "mkdir", "/opt/edited"]);
+    assert!(
+        edited.status.success(),
+        "edit failed with {}\nstderr:\n{}",
+        edited.status,
+        String::from_utf8_lossy(&edited.stderr),
+    );
+    assert_eq!(fs::metadata(&out).unwrap().len(), 129 * 1024 * 1024);
+    let Some(image) = Image::check(&out) else {
+        return;
+    };
+    assert_sample_tree(&image, "/opt/app");
+    assert!(image.list("/opt").contains(&"edited".to_owned()));
+    let stats = image.debugfs("stats");
+    let block_count = stats
+        .lines()
+        .find_map(|line| line.strip_prefix("Block count:"))
+        .and_then(|rest| rest.trim().parse::<u64>().ok())
+        .expect("debugfs stats reports a block count");
+    assert_eq!(block_count, 32768, "{stats}");
+}
+
+#[test]
 fn single_file_lands_in_destination_directory() {
     let tmp = TempDir::new().unwrap();
     let file = tmp.path().join("hosts");

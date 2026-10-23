@@ -21,6 +21,7 @@ pub mod format;
 mod htree;
 mod inode;
 mod layout;
+use layout::PlannedGeometry;
 mod open;
 mod special;
 mod symlink;
@@ -78,12 +79,16 @@ impl DerefMut for DiskData {
 
 impl Ext4ImageBuilder {
     /// Creates an in-memory ext4 image builder of `size_mb`; returns initialized filesystem state.
+    /// A trailing block group without room for its metadata and a few free
+    /// blocks is dropped, so the
+    /// filesystem can be slightly smaller than the requested image; a size
+    /// too small for a single block group panics with a clear message.
     pub fn new(size_mb: usize) -> Self {
         let image_size_bytes = size_mb * 1024 * 1024;
-        Self::new_with_storage(
-            image_size_bytes,
-            DiskData::Memory(vec![0; image_size_bytes]),
-        )
+        let geometry = Self::plan_geometry(image_size_bytes / BLOCK_SIZE).unwrap_or_else(|err| {
+            panic!("cannot lay out an image of {image_size_bytes} bytes: {err}")
+        });
+        Self::new_with_storage(geometry, DiskData::Memory(vec![0; image_size_bytes]))
     }
 
     /// Creates an image directly in `output_path`. The mapping is file-backed,
@@ -93,6 +98,9 @@ impl Ext4ImageBuilder {
         let image_size_bytes = size_mb
             .checked_mul(1024 * 1024)
             .ok_or_else(|| std::io::Error::other("image size overflow"))?;
+        // Reject sizes no block group fits before truncating the output file.
+        let geometry = Self::plan_geometry(image_size_bytes / BLOCK_SIZE)
+            .map_err(|err| std::io::Error::other(err.to_string()))?;
         let path = output_path.as_ref().to_owned();
         let file = OpenOptions::new()
             .read(true)
@@ -105,21 +113,20 @@ impl Ext4ImageBuilder {
         // mapping, and all access is mediated through the uniquely owned MmapMut.
         let mapping = unsafe { MmapOptions::new().map_mut(&file)? };
         Ok(Self::new_with_storage(
-            image_size_bytes,
+            geometry,
             DiskData::File { mapping, path },
         ))
     }
 
-    fn new_with_storage(image_size_bytes: usize, disk_data: DiskData) -> Self {
+    fn new_with_storage(geometry: PlannedGeometry, disk_data: DiskData) -> Self {
         if BYTES_PER_INODE_RATIO < BLOCK_SIZE {
             panic!("BYTES_PER_INODE_RATIO must be greater than or equal to BLOCK_SIZE");
         }
 
-        let blocks_number = image_size_bytes / BLOCK_SIZE;
+        let blocks_number = geometry.blocks_number;
+        let block_groups_number = geometry.block_groups_number;
 
-        let block_groups_number = blocks_number.div_ceil(BLOCKS_PER_GROUP);
-
-        let inodes_per_group = Self::inodes_per_group(blocks_number, block_groups_number);
+        let inodes_per_group = geometry.inodes_per_group;
 
         // Re-calculate actual total inodes based on rounded group count
         let total_inodes = inodes_per_group * block_groups_number;

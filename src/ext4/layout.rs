@@ -7,6 +7,22 @@ use anyhow::Result;
 use std::{fs::File, io::Write, path::Path};
 use zerocopy::IntoBytes;
 
+/// Free blocks a block group must offer beyond its metadata to be kept,
+/// the same margin ext2fs_initialize() demands of the last group. It also
+/// leaves a single-group image room for the root and lost+found.
+const MIN_GROUP_FREE_BLOCKS: usize = 50;
+
+/// Block-group layout chosen for an image by
+/// [`Ext4ImageBuilder::plan_geometry`].
+pub(crate) struct PlannedGeometry {
+    /// Blocks the filesystem spans; at most the requested block count.
+    pub(crate) blocks_number: usize,
+    /// Number of block groups those blocks are split into.
+    pub(crate) block_groups_number: usize,
+    /// Inodes held by each group's inode table.
+    pub(crate) inodes_per_group: usize,
+}
+
 impl Ext4ImageBuilder {
     /// Inodes per group for an image of `blocks` blocks in `groups` groups.
     /// Like ext2fs_initialize(), the count is rounded up so the inode table
@@ -38,6 +54,54 @@ impl Ext4ImageBuilder {
             }
             p == group_idx
         })
+    }
+
+    /// Plans the block-group geometry for an image of `requested_blocks`
+    /// blocks: how many blocks the filesystem spans, how many groups it is
+    /// split into, and how many inodes each group's table holds.
+    ///
+    /// Like ext2fs_initialize(), a trailing block group that cannot hold its
+    /// own metadata (backup superblock and descriptor table where present,
+    /// the two bitmaps and the inode table) plus [`MIN_GROUP_FREE_BLOCKS`]
+    /// is dropped, so the filesystem ends at the last group boundary and the
+    /// image's tail blocks stay unused. Fails when not even one group fits.
+    pub(crate) fn plan_geometry(requested_blocks: usize) -> Result<PlannedGeometry> {
+        if requested_blocks == 0 {
+            anyhow::bail!("an ext4 image needs at least one block");
+        }
+        let mut block_groups_number = requested_blocks.div_ceil(BLOCKS_PER_GROUP);
+        loop {
+            let last_group_blocks = (requested_blocks
+                - (block_groups_number - 1) * BLOCKS_PER_GROUP)
+                .min(BLOCKS_PER_GROUP);
+            let blocks_number = (block_groups_number - 1) * BLOCKS_PER_GROUP + last_group_blocks;
+            let inodes_per_group = Self::inodes_per_group(blocks_number, block_groups_number);
+            let inode_table_blocks = (inodes_per_group * INODE_SIZE).div_ceil(BLOCK_SIZE);
+            let gdt_blocks =
+                (block_groups_number * std::mem::size_of::<Ext4GroupDesc>()).div_ceil(BLOCK_SIZE);
+            let last_idx = block_groups_number - 1;
+            let metadata_blocks = if Self::group_has_super(last_idx) {
+                1 + gdt_blocks
+            } else {
+                0
+            } + 2 // block and inode bitmaps
+                + inode_table_blocks;
+            if last_group_blocks >= metadata_blocks + MIN_GROUP_FREE_BLOCKS {
+                return Ok(PlannedGeometry {
+                    blocks_number,
+                    block_groups_number,
+                    inodes_per_group,
+                });
+            }
+            block_groups_number -= 1;
+            if block_groups_number == 0 {
+                anyhow::bail!(
+                    "an image of {requested_blocks} blocks is too small for one block group, \
+                     which needs {metadata_blocks} blocks of metadata and \
+                     {MIN_GROUP_FREE_BLOCKS} free blocks"
+                );
+            }
+        }
     }
 
     /// Initializes per-group metadata placement and allocation maps; returns no value.
@@ -399,5 +463,54 @@ mod tests {
             let total = builder.superblock.s_inodes_count as usize;
             assert_eq!(total, per_group * builder.groups.len());
         }
+    }
+
+    #[test]
+    fn plan_geometry_drops_a_trailing_group_too_small_for_its_metadata() {
+        // 129 MiB is 33,024 blocks: the 256-block second group cannot hold
+        // its backup superblock, descriptors, bitmaps and ~1032-block inode
+        // table, so the filesystem falls back to a single full group.
+        // 257 MiB and 385 MiB hit the same gap one group later.
+        for (size_mb, blocks, groups) in [(129, 32768, 1), (257, 65536, 2), (385, 98304, 3)] {
+            let geometry =
+                Ext4ImageBuilder::plan_geometry(size_mb * 1024 * 1024 / BLOCK_SIZE).unwrap();
+            assert_eq!(geometry.blocks_number, blocks, "{size_mb} MiB");
+            assert_eq!(geometry.block_groups_number, groups, "{size_mb} MiB");
+        }
+    }
+
+    #[test]
+    fn plan_geometry_keeps_a_trailing_group_large_enough_for_its_metadata() {
+        // 133 MiB is 34,048 blocks: the 1280-block second group exceeds its
+        // 1068-block metadata footprint and stays part of the filesystem.
+        let geometry = Ext4ImageBuilder::plan_geometry(133 * 1024 * 1024 / BLOCK_SIZE).unwrap();
+        assert_eq!(geometry.blocks_number, 34048);
+        assert_eq!(geometry.block_groups_number, 2);
+        // 16 MiB is a single group and must be planned unchanged.
+        let geometry = Ext4ImageBuilder::plan_geometry(16 * 1024 * 1024 / BLOCK_SIZE).unwrap();
+        assert_eq!(geometry.blocks_number, 4096);
+        assert_eq!(geometry.block_groups_number, 1);
+    }
+
+    #[test]
+    fn plan_geometry_requires_free_blocks_beyond_the_metadata() {
+        // A 1100-block second group holds its 1063 metadata blocks but not
+        // the 50 free blocks on top, so it is dropped; at 1120 blocks the
+        // same 1063-block footprint plus the margin fits.
+        let geometry = Ext4ImageBuilder::plan_geometry(BLOCKS_PER_GROUP + 1100).unwrap();
+        assert_eq!(geometry.block_groups_number, 1);
+        let geometry = Ext4ImageBuilder::plan_geometry(BLOCKS_PER_GROUP + 1120).unwrap();
+        assert_eq!(geometry.block_groups_number, 2);
+        assert_eq!(geometry.blocks_number, BLOCKS_PER_GROUP + 1120);
+    }
+
+    #[test]
+    fn plan_geometry_rejects_images_without_room_for_one_group() {
+        assert!(Ext4ImageBuilder::plan_geometry(0).is_err());
+        // 57 blocks need a 64-inode table (four blocks), so the superblock,
+        // descriptor table, bitmaps and that table leave only 49 free blocks;
+        // 58 blocks leave the required 50.
+        assert!(Ext4ImageBuilder::plan_geometry(57).is_err());
+        assert!(Ext4ImageBuilder::plan_geometry(58).is_ok());
     }
 }
