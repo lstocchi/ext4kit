@@ -55,6 +55,28 @@ impl Ext4ImageBuilder {
         Self::recommended_image_size_mib_for_usage(usage, additional_directories)
     }
 
+    /// Fails when the image has fewer free blocks or inodes than importing
+    /// `tree` needs, so that an import into an existing image does not stop
+    /// halfway for lack of space.  Like the sizing estimate this is
+    /// approximate: it does not count extent-tree or directory-growth blocks,
+    /// nor space freed by entries the import replaces.
+    pub fn ensure_room_for_host_tree(&self, tree: &HostTree) -> Result<()> {
+        let free_blocks = u64::from(self.superblock.s_free_blocks_count_lo);
+        let free_inodes = u64::from(self.superblock.s_free_inodes_count);
+        let HostUsage {
+            data_blocks,
+            inodes,
+        } = tree.usage;
+        if data_blocks > free_blocks || inodes > free_inodes {
+            return Err(anyhow::anyhow!(
+                "not enough free space: the import needs about {data_blocks} blocks and \
+                 {inodes} inodes, the image has {free_blocks} free blocks and {free_inodes} \
+                 free inodes"
+            ));
+        }
+        Ok(())
+    }
+
     fn recommended_image_size_mib_for_usage(
         mut usage: HostUsage,
         additional_directories: usize,

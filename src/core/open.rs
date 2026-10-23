@@ -46,6 +46,23 @@ impl Ext4ImageBuilder {
         Self::load(DiskData::File { mapping, path })
     }
 
+    /// Opens an image file written by ext4kit for inspection only.  The
+    /// file needs only read access; the returned builder may still run
+    /// mutating operations, but their effects stay in private memory and
+    /// [`Ext4ImageBuilder::write_to_file`] refuses to save them.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let file = std::fs::File::open(path)
+            .map_err(|error| anyhow!("cannot open {}: {error}", path.display()))?;
+        if file.metadata()?.len() < 2 * 1024 {
+            bail!("{} is too small to be an ext4 image", path.display());
+        }
+        // A private mapping: pages written by the builder are copied, so the
+        // file itself is never modified.
+        let mapping = unsafe { MmapOptions::new().map_copy(&file)? };
+        Self::load(DiskData::ReadOnly(mapping))
+    }
+
     /// Loads an image written by ext4kit from memory; see
     /// [`Ext4ImageBuilder::open`].
     pub fn from_image(data: Vec<u8>) -> Result<Self> {

@@ -4,6 +4,7 @@
 //! callers can use this library to build their own images.
 
 pub mod core;
+pub mod edit;
 pub mod ext4;
 pub mod host;
 pub mod oci;

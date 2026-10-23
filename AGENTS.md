@@ -26,6 +26,7 @@ cargo test <name_substring>      # a single test
 cargo fmt                        # CI-style check: cargo fmt --check
 cargo clippy --all-targets       # must report zero warnings
 cargo run -- create --add <SRC>[:/DEST] [--from IMAGE] [--size MIB] out.img
+cargo run -- edit out.img <rm|mkdir|chmod|chown|add|write|cat|test|ln> ...
 bash scripts/verify-image.sh out.img ['debugfs request' ...]
 ```
 
@@ -50,6 +51,7 @@ well.
 | `src/xattr.rs` | External xattr block encoding, POSIX ACL conversion |
 | `src/host/` | Host directory import (`dua-core` walk) and sizing; `tree.rs` is the pre-scanned `HostTree` arena |
 | `src/oci/` | Tar layer application with whiteouts (`mod.rs`), registry pulls (`remote.rs`), Docker/Podman engines (`local.rs`) |
+| `src/edit.rs` | Path-level edits with coreutils semantics (`remove_path`, `make_directory`, `chmod_path`, `chown_path`, `write_path`, `test_path`, ...) behind `ext4kit edit` |
 | `src/main.rs` | Thin clap CLI: argument parsing, sizing and orchestration only. Filesystem logic belongs in the library |
 
 See [docs/architecture.md](docs/architecture.md) for the two-pass and
@@ -99,7 +101,8 @@ streaming import design.
   natively or through WSL, like the verify script. When it is missing the
   checks are skipped with a note; CI sets `EXT4KIT_REQUIRE_E2FSPROGS=1` so
   they fail instead. `oci.rs` holds `#[ignore]`d `--from` tests that need
-  Docker Hub or a Docker engine.
+  Docker Hub or a Docker engine. `open.rs` reopens created images through
+  the library, and `edit.rs` runs sequences of `ext4kit edit` calls.
 - Build small images in memory with `Ext4ImageBuilder::new(16)`, then call
   `create_root_dir()`, `create_lost_and_found()` and `reserve_inodes()`
   (see `fresh_builder()` in `core/directory.rs`). Assert by reading back

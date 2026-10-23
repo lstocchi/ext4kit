@@ -1,6 +1,7 @@
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use ext4kit::{
     core::Ext4ImageBuilder,
+    edit::{EntryAttributes, PathTest},
     ext4::EXT4_ROOT_INO,
     host::HostTree,
     oci::{
@@ -12,11 +13,13 @@ use ext4kit::{
 use std::{
     collections::HashSet,
     fs,
+    io::{self, Read, Write},
     path::{Path, PathBuf},
+    process::ExitCode,
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "ext4kit", about = "Create ext4 images from host directories")]
+#[command(name = "ext4kit", about = "Create and edit ext4 images without Linux")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -63,18 +66,182 @@ enum Command {
         #[arg(long, value_name = "UID[:GID]", value_parser = parse_owner)]
         root_owner: Option<(u32, u32)>,
     },
+
+    /// Change an image created by ext4kit in place, one operation per call.
+    /// Image paths are absolute; parent directories resolve through symlinks
+    /// inside the image. A failed operation exits non-zero and leaves the
+    /// image consistent.
+    Edit {
+        /// Image created by ext4kit.
+        #[arg(value_name = "IMAGE.IMG")]
+        image: PathBuf,
+
+        #[command(subcommand)]
+        action: EditAction,
+    },
 }
 
-fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-    let Command::Create {
-        add,
-        from,
-        output,
-        size,
-        chown,
-        root_owner,
-    } = cli.command;
+#[derive(Debug, Subcommand)]
+enum EditAction {
+    /// Remove a file or symlink, or a directory tree with -r. A final
+    /// symlink is removed itself, never its target.
+    Rm {
+        /// Remove directories and their contents.
+        #[arg(short = 'r', short_alias = 'R', long)]
+        recursive: bool,
+        /// Succeed when the path does not exist.
+        #[arg(short, long)]
+        force: bool,
+        #[arg(value_name = "PATH")]
+        path: String,
+    },
+    /// Create a directory (mode 0755 and root ownership unless given).
+    Mkdir {
+        /// Create missing parents; an existing directory is left unchanged.
+        #[arg(short, long)]
+        parents: bool,
+        /// Octal permissions of the new directory.
+        #[arg(short, long, value_parser = parse_mode)]
+        mode: Option<u16>,
+        /// Numeric owner of the new directory. A missing GID defaults to the UID.
+        #[arg(long, value_name = "UID[:GID]", value_parser = parse_owner)]
+        owner: Option<(u32, u32)>,
+        #[arg(value_name = "PATH")]
+        path: String,
+    },
+    /// Set octal permission bits, following symlinks.
+    Chmod {
+        #[arg(value_parser = parse_mode)]
+        mode: u16,
+        #[arg(value_name = "PATH")]
+        path: String,
+    },
+    /// Set the numeric owner. Follows a final symlink unless -R is given;
+    /// -R follows no symlinks at all, like `chown -R -P`.
+    Chown {
+        /// Change the whole tree below PATH.
+        #[arg(short = 'R', long)]
+        recursive: bool,
+        /// A missing GID defaults to the UID.
+        #[arg(value_name = "UID[:GID]", value_parser = parse_owner)]
+        owner: (u32, u32),
+        #[arg(value_name = "PATH")]
+        path: String,
+    },
+    /// Import a host file or directory like `create --add`: a directory is
+    /// merged into an existing one, anything else is replaced.
+    Add {
+        /// Numeric owner for the imported entries and the destination
+        /// directories created for them. A missing GID defaults to the UID.
+        #[arg(long, value_name = "UID[:GID]", value_parser = parse_owner)]
+        chown: Option<(u32, u32)>,
+        #[arg(value_name = "SOURCE[:/DESTINATION]")]
+        source: String,
+    },
+    /// Write a host file (or stdin with -) to an image file. An existing
+    /// file keeps its inode, links, timestamps and xattrs, and its mode and
+    /// owner unless given; a new file is 0644 root:root unless given.
+    Write {
+        /// Octal permissions to set.
+        #[arg(short, long, value_parser = parse_mode)]
+        mode: Option<u16>,
+        /// Numeric owner to set. A missing GID defaults to the UID.
+        #[arg(long, value_name = "UID[:GID]", value_parser = parse_owner)]
+        owner: Option<(u32, u32)>,
+        /// Host file, or - for stdin.
+        #[arg(value_name = "HOST_FILE")]
+        source: PathBuf,
+        #[arg(value_name = "PATH")]
+        path: String,
+    },
+    /// Print an image file to stdout, following symlinks. Opens the image
+    /// read-only.
+    Cat {
+        #[arg(value_name = "PATH")]
+        path: String,
+    },
+    /// Exit 0 when the predicate holds and 1 when it does not, like
+    /// test(1); 2 means the check itself failed. Opens the image read-only.
+    Test {
+        #[command(flatten)]
+        predicate: TestPredicate,
+        #[arg(value_name = "PATH")]
+        path: String,
+    },
+    /// Create a hard link, or a symlink with -s, at LINK.
+    Ln {
+        /// Create a symlink; TARGET is stored as given and need not exist.
+        #[arg(short, long)]
+        symbolic: bool,
+        #[arg(value_name = "TARGET")]
+        target: String,
+        #[arg(value_name = "LINK")]
+        link: String,
+    },
+}
+
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+struct TestPredicate {
+    /// PATH exists, following symlinks.
+    #[arg(short = 'e')]
+    exists: bool,
+    /// PATH is a regular file, following symlinks.
+    #[arg(short = 'f')]
+    file: bool,
+    /// PATH is a directory, following symlinks.
+    #[arg(short = 'd')]
+    directory: bool,
+    /// PATH has an execute bit, following symlinks.
+    #[arg(short = 'x')]
+    executable: bool,
+    /// PATH itself is a symlink.
+    #[arg(short = 'L')]
+    symlink: bool,
+}
+
+impl TestPredicate {
+    fn path_test(&self) -> PathTest {
+        match self {
+            Self { exists: true, .. } => PathTest::Exists,
+            Self { file: true, .. } => PathTest::File,
+            Self {
+                directory: true, ..
+            } => PathTest::Directory,
+            Self {
+                executable: true, ..
+            } => PathTest::Executable,
+            _ => PathTest::Symlink,
+        }
+    }
+}
+
+fn main() -> ExitCode {
+    let result = match Cli::parse().command {
+        Command::Create {
+            add,
+            from,
+            output,
+            size,
+            chown,
+            root_owner,
+        } => run_create(add, from, output, size, chown, root_owner).map(|()| ExitCode::SUCCESS),
+        Command::Edit { image, action } => run_edit(&image, action),
+    };
+    result.unwrap_or_else(|error| {
+        eprintln!("Error: {error:?}");
+        ExitCode::FAILURE
+    })
+}
+
+fn run_create(
+    add: Vec<String>,
+    from: Option<String>,
+    output: PathBuf,
+    size: Option<usize>,
+    chown: Option<(u32, u32)>,
+    root_owner: Option<(u32, u32)>,
+) -> anyhow::Result<()> {
     let additions: Vec<Addition> = add
         .iter()
         .map(|add| parse_add(add))
@@ -149,23 +316,8 @@ fn main() -> anyhow::Result<()> {
     let mut import_order: Vec<_> = (0..additions.len()).collect();
     import_order.sort_by_key(|&index| additions[index].target().matches('/').count());
     for index in import_order {
-        let addition = &additions[index];
-        let destination_parent = builder.ensure_host_destination(&addition.destination)?;
-        let name = addition.name();
-        let existing = builder.lookup_dir_entry(destination_parent, name)?;
-        match existing {
-            Some(inode) if addition.is_directory()? && builder.is_directory(inode) => {
-                builder.overlay_host_directory(inode, &addition.source)?;
-            }
-            _ => {
-                builder.remove_dir_entry(destination_parent, name)?;
-                if let Some(trees) = &host_trees {
-                    builder.import_host_tree(destination_parent, &trees[index])?;
-                } else {
-                    builder.import_host_path_streaming(destination_parent, &addition.source)?;
-                }
-            }
-        }
+        let tree = host_trees.as_ref().map(|trees| &trees[index]);
+        import_addition(&mut builder, &additions[index], tree)?;
     }
 
     // Applied last so a root entry in a --from layer cannot override it.
@@ -178,6 +330,145 @@ fn main() -> anyhow::Result<()> {
     })?)?;
 
     println!("Ext4 image successfully generated at: {}", output.display());
+    Ok(())
+}
+
+/// Imports one addition: a host directory is merged into an existing image
+/// directory of the same name, anything else replaces the existing entry.
+/// A pre-scanned `tree` is imported without walking the host again.
+fn import_addition(
+    builder: &mut Ext4ImageBuilder,
+    addition: &Addition,
+    tree: Option<&HostTree>,
+) -> anyhow::Result<()> {
+    let destination_parent = builder.ensure_host_destination(&addition.destination)?;
+    let name = addition.name();
+    match builder.lookup_dir_entry(destination_parent, name)? {
+        Some(inode) if addition.is_directory()? && builder.is_directory(inode) => {
+            builder.overlay_host_directory(inode, &addition.source)?;
+        }
+        _ => {
+            builder.remove_dir_entry(destination_parent, name)?;
+            match tree {
+                Some(tree) => builder.import_host_tree(destination_parent, tree)?,
+                None => builder.import_host_path_streaming(destination_parent, &addition.source)?,
+            };
+        }
+    }
+    Ok(())
+}
+
+/// Runs one `edit` action on `image`.  `cat` and `test` open the image
+/// read-only.  Every other action saves the image afterwards, also when it
+/// failed: builder operations validate before they commit, so the state in
+/// memory is consistent even when a multi-step action such as `add` or
+/// `mkdir -p` stops partway, and the data and directory blocks it already
+/// wrote to the file need their matching bitmaps and inode tables.
+fn run_edit(image: &Path, action: EditAction) -> anyhow::Result<ExitCode> {
+    match action {
+        EditAction::Cat { path } => {
+            let builder = Ext4ImageBuilder::open_read_only(image)?;
+            let mut stdout = io::BufWriter::new(io::stdout().lock());
+            builder.cat_path(&path, &mut stdout)?;
+            stdout.flush()?;
+            Ok(ExitCode::SUCCESS)
+        }
+        EditAction::Test { predicate, path } => {
+            let result = Ext4ImageBuilder::open_read_only(image)
+                .and_then(|builder| builder.test_path(&path, predicate.path_test()));
+            Ok(match result {
+                Ok(true) => ExitCode::SUCCESS,
+                Ok(false) => ExitCode::from(1),
+                Err(error) => {
+                    eprintln!("Error: {error:?}");
+                    ExitCode::from(2)
+                }
+            })
+        }
+        action => {
+            let image_path = image.to_str().ok_or_else(|| {
+                anyhow::anyhow!("image path is not valid UTF-8: {}", image.display())
+            })?;
+            let mut builder = Ext4ImageBuilder::open(image)?;
+            let result = apply_edit(&mut builder, action);
+            let saved = builder.write_to_file(image_path);
+            result?;
+            saved?;
+            Ok(ExitCode::SUCCESS)
+        }
+    }
+}
+
+/// Applies a mutating `edit` action to an opened image.
+fn apply_edit(builder: &mut Ext4ImageBuilder, action: EditAction) -> anyhow::Result<()> {
+    match action {
+        EditAction::Rm {
+            recursive,
+            force,
+            path,
+        } => {
+            if !builder.remove_path(&path, recursive)? && !force {
+                anyhow::bail!("cannot remove {path}: no such file or directory");
+            }
+        }
+        EditAction::Mkdir {
+            parents,
+            mode,
+            owner,
+            path,
+        } => {
+            builder.make_directory(&path, parents, EntryAttributes { mode, owner })?;
+        }
+        EditAction::Chmod { mode, path } => builder.chmod_path(&path, mode)?,
+        EditAction::Chown {
+            recursive,
+            owner: (uid, gid),
+            path,
+        } => {
+            builder.chown_path(&path, uid, gid, recursive)?;
+        }
+        EditAction::Add { chown, source } => {
+            let addition = parse_add(&source)?;
+            let tree = HostTree::scan(&addition.source)?;
+            builder.ensure_room_for_host_tree(&tree)?;
+            builder.set_host_owner(chown);
+            import_addition(builder, &addition, Some(&tree))?;
+        }
+        EditAction::Write {
+            mode,
+            owner,
+            source,
+            path,
+        } => {
+            let attributes = EntryAttributes { mode, owner };
+            if source.as_os_str() == "-" {
+                // The size must be known before the first block is written.
+                let mut data = Vec::new();
+                io::stdin().lock().read_to_end(&mut data)?;
+                builder.write_path(&path, &data[..], data.len() as u64, attributes)?;
+            } else {
+                let file = fs::File::open(&source).map_err(|error| {
+                    anyhow::anyhow!("cannot open {}: {error}", source.display())
+                })?;
+                let size = file.metadata()?.len();
+                builder.write_path(&path, file, size, attributes)?;
+            }
+        }
+        EditAction::Ln {
+            symbolic,
+            target,
+            link,
+        } => {
+            if symbolic {
+                builder.symlink_path(&target, &link, EntryAttributes::default())?;
+            } else {
+                builder.hard_link_path(&target, &link)?;
+            }
+        }
+        EditAction::Cat { .. } | EditAction::Test { .. } => {
+            unreachable!("run_edit handles the read-only actions")
+        }
+    }
     Ok(())
 }
 
@@ -353,6 +644,14 @@ fn parse_owner(value: &str) -> Result<(u32, u32), String> {
     Ok((uid, gid))
 }
 
+/// Parses octal permission bits such as `755` or `0644`, up to `7777`.
+fn parse_mode(value: &str) -> Result<u16, String> {
+    u16::from_str_radix(value, 8)
+        .ok()
+        .filter(|&mode| mode <= 0o7777)
+        .ok_or_else(|| format!("mode must be octal from 0 to 7777, got {value:?}"))
+}
+
 /// Rejects filesystem roots, which have no name to place in the image.
 fn validate_add_source(source: &Path) -> anyhow::Result<()> {
     match source.file_name().and_then(|name| name.to_str()) {
@@ -444,9 +743,9 @@ fn reject_target_collisions(
 #[cfg(test)]
 mod tests {
     use super::{
-        Addition, Cli, Command, RequestedTransport, destination_directories, local_image_size_mib,
-        output_image_size_mib, parse_add, parse_owner, reject_target_collisions,
-        requested_transport,
+        Addition, Cli, Command, EditAction, PathTest, RequestedTransport, destination_directories,
+        local_image_size_mib, output_image_size_mib, parse_add, parse_mode, parse_owner,
+        reject_target_collisions, requested_transport,
     };
     use clap::Parser;
     use ext4kit::oci::local::Engine;
@@ -464,7 +763,9 @@ mod tests {
             "output.img",
         ])
         .unwrap();
-        let Command::Create { size, .. } = cli.command;
+        let Command::Create { size, .. } = cli.command else {
+            panic!("expected create")
+        };
         assert_eq!(size, Some(3200));
     }
 
@@ -507,7 +808,9 @@ mod tests {
             "output.img",
         ])
         .unwrap();
-        let Command::Create { chown, .. } = cli.command;
+        let Command::Create { chown, .. } = cli.command else {
+            panic!("expected create")
+        };
         assert_eq!(chown, Some((1000, 1000)));
     }
 
@@ -523,7 +826,9 @@ mod tests {
             "output.img",
         ])
         .unwrap();
-        let Command::Create { root_owner, .. } = cli.command;
+        let Command::Create { root_owner, .. } = cli.command else {
+            panic!("expected create")
+        };
         assert_eq!(root_owner, Some((1000, 1000)));
     }
 
@@ -539,7 +844,9 @@ mod tests {
             "output.img",
         ])
         .unwrap();
-        let Command::Create { from, add, .. } = cli.command;
+        let Command::Create { from, add, .. } = cli.command else {
+            panic!("expected create")
+        };
         assert_eq!(from.as_deref(), Some("docker.io/library/alpine:latest"));
         assert!(add.is_empty());
     }
@@ -556,7 +863,9 @@ mod tests {
             "output.img",
         ])
         .unwrap();
-        let Command::Create { from, add, .. } = cli.command;
+        let Command::Create { from, add, .. } = cli.command else {
+            panic!("expected create")
+        };
         assert_eq!(from.as_deref(), Some("docker-daemon:alpine:latest"));
         assert!(add.is_empty());
     }
@@ -575,7 +884,10 @@ mod tests {
         .unwrap();
         let Command::Create {
             from, add, size, ..
-        } = cli.command;
+        } = cli.command
+        else {
+            panic!("expected create")
+        };
         assert_eq!(from.as_deref(), Some("docker://example/image"));
         assert_eq!(add, vec![String::from("host:/opt")]);
         assert_eq!(size, None);
@@ -672,5 +984,52 @@ mod tests {
         assert!(directories.contains("/a/b"));
         assert!(reject_target_collisions(&additions, &directories).is_ok());
         fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn parses_octal_modes() {
+        assert_eq!(parse_mode("755"), Ok(0o755));
+        assert_eq!(parse_mode("0644"), Ok(0o644));
+        assert_eq!(parse_mode("4755"), Ok(0o4755));
+        for bad in ["", "8", "10000", "rwx", "-1"] {
+            assert!(parse_mode(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn parses_edit_actions() {
+        let cli =
+            Cli::try_parse_from(["ext4kit", "edit", "img", "chown", "-R", "1000", "/sandbox"])
+                .unwrap();
+        let Command::Edit {
+            action: EditAction::Chown {
+                recursive, owner, ..
+            },
+            ..
+        } = cli.command
+        else {
+            panic!("expected edit chown");
+        };
+        assert!(recursive);
+        assert_eq!(owner, (1000, 1000));
+
+        let cli = Cli::try_parse_from(["ext4kit", "edit", "img", "test", "-x", "/bin/sh"]).unwrap();
+        let Command::Edit {
+            action: EditAction::Test { predicate, .. },
+            ..
+        } = cli.command
+        else {
+            panic!("expected edit test");
+        };
+        assert_eq!(predicate.path_test(), PathTest::Executable);
+    }
+
+    #[test]
+    fn edit_test_needs_exactly_one_predicate() {
+        for args in [&["/bin/sh"][..], &["-e", "-x", "/bin/sh"]] {
+            let mut full = vec!["ext4kit", "edit", "img", "test"];
+            full.extend_from_slice(args);
+            assert!(Cli::try_parse_from(full).is_err(), "{args:?}");
+        }
     }
 }

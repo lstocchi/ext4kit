@@ -69,6 +69,16 @@ Device methods accept a Linux major number up to 4,095 and minor number up to
 1,048,575. Special nodes do not allocate data extents, though they may use an
 external xattr block.
 
+## Editing existing images
+
+`Ext4ImageBuilder::open` loads an image that ext4kit wrote back into the
+builder, and `ext4kit edit` exposes path-level operations on it: `rm`,
+`mkdir`, `chmod`, `chown` (recursive without following symlinks), `add`,
+`write` (in-place content replacement that keeps the inode, links, timestamps
+and xattrs), `cat`, `test` and `ln`. Images in any other format, including
+those made by `mke2fs`, are rejected. The image size is fixed. See
+[Editing images](editing.md).
+
 ## Design constraints and limitations
 
 - Image creation runs on Windows; Linux tools are only optional verification.

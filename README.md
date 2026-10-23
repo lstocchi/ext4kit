@@ -84,6 +84,26 @@ flags take numeric IDs only, because the user that matters is the one in the
 VM the disk is attached to, not one in an image's `/etc/passwd`. A missing GID
 defaults to the UID.
 
+### Editing an image
+
+`ext4kit edit` changes an image that `create` wrote, one coreutils-style
+action per call, so fix-ups that would otherwise need a Linux VM run as a
+plain script:
+
+```powershell
+cargo run -- edit output.img rm -f /opt/app/.initialized
+cargo run -- edit output.img mkdir -p /sandbox
+cargo run -- edit output.img chown -R 1000:1000 /sandbox
+cargo run -- edit output.img cat /etc/passwd > passwd
+cargo run -- edit output.img write passwd /etc/passwd
+cargo run -- edit output.img test -x /bin/sh
+```
+
+The actions are `rm`, `mkdir`, `chmod`, `chown`, `add`, `write`, `cat`,
+`test` and `ln`. They work on entries from `--from` as well as `--add`, and
+only on images that ext4kit created. See [Editing images](docs/editing.md)
+for their exact behaviour, failure handling and an OpenShell rootfs recipe.
+
 In library code, initialize the root directory and then call
 `builder.import_host_root(source)`, or use `import_host_directory(parent, source)`
 to create an appropriately named child directory beneath an existing ext4
@@ -124,4 +144,5 @@ Windows, and skip those checks with a note when it is missing. CI
 
 - [Architecture](docs/architecture.md)
 - [Supported features](docs/supported-features.md)
+- [Editing images](docs/editing.md)
 - [Roadmap and intended workflows](docs/roadmap.md)

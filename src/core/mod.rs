@@ -46,10 +46,16 @@ pub struct Ext4ImageBuilder {
 }
 
 /// Mutable image bytes backed either by memory (primarily tests and library
-/// compatibility) or by the destination file used for streamed image builds.
+/// compatibility), by the destination file used for streamed image builds,
+/// or by a private copy-on-write mapping of an image opened read-only.
 pub enum DiskData {
     Memory(Vec<u8>),
-    File { mapping: MmapMut, path: PathBuf },
+    File {
+        mapping: MmapMut,
+        path: PathBuf,
+    },
+    /// Changes stay in private pages and never reach the file.
+    ReadOnly(MmapMut),
 }
 
 impl Deref for DiskData {
@@ -58,7 +64,7 @@ impl Deref for DiskData {
     fn deref(&self) -> &Self::Target {
         match self {
             Self::Memory(data) => data,
-            Self::File { mapping, .. } => mapping,
+            Self::File { mapping, .. } | Self::ReadOnly(mapping) => mapping,
         }
     }
 }
@@ -67,7 +73,7 @@ impl DerefMut for DiskData {
     fn deref_mut(&mut self) -> &mut Self::Target {
         match self {
             Self::Memory(data) => data,
-            Self::File { mapping, .. } => mapping,
+            Self::File { mapping, .. } | Self::ReadOnly(mapping) => mapping,
         }
     }
 }
@@ -689,6 +695,12 @@ impl Ext4ImageBuilder {
     /// Flushes Superblock and Group Descriptors into disk_data, then writes to file
     /// Finalizes metadata and writes the image to `output_path`; returns I/O success or failure.
     pub fn write_to_file(&mut self, output_path: &str) -> std::io::Result<()> {
+        if matches!(self.disk_data, DiskData::ReadOnly(_)) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "image was opened read-only",
+            ));
+        }
         self.commit_metadata();
         // Flush file-backed pages, or write the compatibility in-memory image.
         match &mut self.disk_data {
@@ -708,6 +720,7 @@ impl Ext4ImageBuilder {
                 }
                 mapping.flush()?;
             }
+            DiskData::ReadOnly(_) => unreachable!("rejected above"),
         }
         Ok(())
     }
