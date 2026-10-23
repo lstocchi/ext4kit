@@ -1,75 +1,60 @@
 //! Ext4 extended-attribute block encoding and POSIX ACL conversion.
 
-use crate::{
-    ext4::format::*,
-    ext4::{Ext4ImageBuilder, directory::PreparedXattr},
-};
+use super::*;
 use anyhow::Result;
 use std::collections::HashMap;
 use zerocopy::IntoBytes;
 
-impl Ext4ImageBuilder {
-    /// Serializes an unshared ext4 xattr block; returns its allocated physical block number.
-    pub fn write_xattr_block(
-        &mut self,
-        group: usize,
-        xattrs: &HashMap<String, Vec<u8>>,
-    ) -> Result<u32> {
-        let xattrs = prepare_xattrs(xattrs)?;
-        self.write_prepared_xattr_block(group, &xattrs)
-    }
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedXattr {
+    pub(crate) index: u8,
+    pub(crate) suffix: String,
+    pub(crate) value: Vec<u8>,
+}
 
-    /// Writes already validated xattrs into one block; returns that block's physical number.
-    pub(crate) fn write_prepared_xattr_block(
-        &mut self,
-        group: usize,
-        xattrs: &[PreparedXattr],
-    ) -> Result<u32> {
-        let mut data = vec![0; BLOCK_SIZE];
-        let header = Ext4XattrHeader {
-            h_magic: EXT4_XATTR_MAGIC,
-            h_refcount: 1,
-            h_blocks: 1,
-            ..Default::default()
-        };
-        data[..32].copy_from_slice(header.as_bytes());
+/// Encodes validated xattrs as one unshared external xattr block with its
+/// entry and block hashes; returns the block's bytes.
+pub(crate) fn encode_xattr_block(xattrs: &[PreparedXattr]) -> Result<Vec<u8>> {
+    let mut data = vec![0; BLOCK_SIZE];
+    let header = Ext4XattrHeader {
+        h_magic: EXT4_XATTR_MAGIC,
+        h_refcount: 1,
+        h_blocks: 1,
+        ..Default::default()
+    };
+    data[..32].copy_from_slice(header.as_bytes());
 
-        let (mut entry, mut value) = (32, BLOCK_SIZE);
-        let mut block_hash = 0u32;
-        for xattr in xattrs {
-            let aligned_value_len = align4(xattr.value.len());
-            value = value
-                .checked_sub(aligned_value_len)
-                .ok_or(anyhow::anyhow!("xattrs exceed one filesystem block"))?;
-            let entry_len = 16 + align4(xattr.suffix.len());
-            if entry + entry_len + 4 > value {
-                return Err(anyhow::anyhow!("xattrs exceed one filesystem block"));
-            }
-            let entry_hash = xattr_entry_hash(xattr.suffix.as_bytes(), &xattr.value);
-            let xattr_entry = Ext4XattrEntry {
-                e_name_len: xattr.suffix.len() as u8,
-                e_name_index: xattr.index,
-                e_value_offs: value as u16,
-                e_value_block: 0,
-                e_value_size: xattr.value.len() as u32,
-                e_hash: entry_hash,
-            };
-            data[entry..entry + 16].copy_from_slice(xattr_entry.as_bytes());
-            block_hash = block_hash.rotate_left(16) ^ entry_hash;
-            data[entry + 16..entry + 16 + xattr.suffix.len()]
-                .copy_from_slice(xattr.suffix.as_bytes());
-            // Values occupy an aligned extent on disk. Clear it explicitly so that
-            // alignment padding remains deterministic if this buffer is ever reused.
-            data[value..value + aligned_value_len].fill(0);
-            data[value..value + xattr.value.len()].copy_from_slice(&xattr.value);
-            entry += entry_len;
+    let (mut entry, mut value) = (32, BLOCK_SIZE);
+    let mut block_hash = 0u32;
+    for xattr in xattrs {
+        let aligned_value_len = align4(xattr.value.len());
+        value = value
+            .checked_sub(aligned_value_len)
+            .ok_or(anyhow::anyhow!("xattrs exceed one filesystem block"))?;
+        let entry_len = 16 + align4(xattr.suffix.len());
+        if entry + entry_len + 4 > value {
+            return Err(anyhow::anyhow!("xattrs exceed one filesystem block"));
         }
-        data[12..16].copy_from_slice(&block_hash.to_le_bytes());
-        let number = self.allocate_free_blocks(group, 1)?;
-        let offset = number as usize * BLOCK_SIZE;
-        self.disk_data[offset..offset + BLOCK_SIZE].copy_from_slice(&data);
-        Ok(number)
+        let entry_hash = xattr_entry_hash(xattr.suffix.as_bytes(), &xattr.value);
+        let xattr_entry = Ext4XattrEntry {
+            e_name_len: xattr.suffix.len() as u8,
+            e_name_index: xattr.index,
+            e_value_offs: value as u16,
+            e_value_block: 0,
+            e_value_size: xattr.value.len() as u32,
+            e_hash: entry_hash,
+        };
+        data[entry..entry + 16].copy_from_slice(xattr_entry.as_bytes());
+        block_hash = block_hash.rotate_left(16) ^ entry_hash;
+        data[entry + 16..entry + 16 + xattr.suffix.len()].copy_from_slice(xattr.suffix.as_bytes());
+        // Values occupy an aligned extent on disk. Clear it explicitly so that
+        // alignment padding remains deterministic if this buffer is ever reused.
+        data[value..value + aligned_value_len].fill(0);
+        data[value..value + xattr.value.len()].copy_from_slice(&xattr.value);
+        entry += entry_len;
     }
+    data[12..16].copy_from_slice(&block_hash.to_le_bytes());
+    Ok(data)
 }
 
 /// Parses a Linux xattr name; returns its ext4 namespace index and unprefixed suffix.
@@ -171,4 +156,25 @@ pub(crate) fn posix_acl_to_ext4_disk(value: &[u8]) -> Result<Vec<u8>> {
         }
     }
     Ok(disk)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn posix_acl_is_converted_to_compact_ext4_encoding() {
+        let mut host_acl = Vec::new();
+        host_acl.extend_from_slice(&2u32.to_le_bytes());
+        for (tag, perm, id) in [(0x01u16, 7u16, 0u32), (0x04, 5, 0), (0x20, 5, 0)] {
+            host_acl.extend_from_slice(&tag.to_le_bytes());
+            host_acl.extend_from_slice(&perm.to_le_bytes());
+            host_acl.extend_from_slice(&id.to_le_bytes());
+        }
+        let disk_acl = posix_acl_to_ext4_disk(&host_acl).unwrap();
+        assert_eq!(
+            disk_acl,
+            vec![1, 0, 0, 0, 1, 0, 7, 0, 4, 0, 5, 0, 32, 0, 5, 0]
+        );
+    }
 }

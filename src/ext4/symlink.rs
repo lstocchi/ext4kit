@@ -1,6 +1,7 @@
-//! Extracted core filesystem operations.
+//! Symbolic links, stored inline below 60 bytes and in one data block
+//! otherwise.
 
-use super::{Ext4ImageBuilder, directory::PosixMetadata};
+use super::{Ext4ImageBuilder, inode::PosixMetadata};
 use crate::ext4::format::xattr::prepare_xattrs;
 use crate::ext4::format::*;
 use anyhow::Result;
@@ -103,5 +104,82 @@ impl Ext4ImageBuilder {
             };
             inode.i_block[12..24].copy_from_slice(extent.as_bytes());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ext4::test_support::fresh_builder;
+    use zerocopy::FromBytes;
+
+    #[test]
+    fn symlinks_use_fast_and_slow_storage_at_e2fsprogs_boundary() {
+        let mut builder = fresh_builder().expect("failed to create builder");
+        let metadata = PosixMetadata::default();
+
+        let fast_ino = builder
+            .add_symlink(EXT4_ROOT_INO, "fast", &"f".repeat(59), &metadata)
+            .expect("failed to create fast symlink");
+        let (fast_group, fast_index) = builder.inode_location(fast_ino);
+        let fast = &builder.groups[fast_group].inode_table[fast_index];
+        let (fast_mode, fast_size, fast_blocks) = (fast.i_mode, fast.i_size_lo, fast.i_blocks_lo);
+        assert_eq!(fast_mode, S_IFLNK | 0o777);
+        assert_eq!(fast_size, 59);
+        assert_eq!(fast_blocks, 0);
+        assert_eq!(
+            &fast.i_block[..59],
+            b"fffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        );
+
+        let target = "s".repeat(60);
+        let slow_ino = builder
+            .add_symlink(EXT4_ROOT_INO, "slow", &target, &metadata)
+            .expect("failed to create slow symlink");
+        let (slow_group, slow_index) = builder.inode_location(slow_ino);
+        let slow = &builder.groups[slow_group].inode_table[slow_index];
+        let extent = Ext4Extent::read_from_bytes(&slow.i_block[12..24]).unwrap();
+        let block_offset = extent.ee_start_lo as usize * BLOCK_SIZE;
+        let (slow_size, slow_blocks, extent_len) =
+            (slow.i_size_lo, slow.i_blocks_lo, extent.ee_len);
+        assert_eq!(slow_size, 60);
+        assert_eq!(slow_blocks, (BLOCK_SIZE / 512) as u32);
+        assert_eq!(extent_len, 1);
+        assert_eq!(
+            &builder.disk_data[block_offset..block_offset + 60],
+            target.as_bytes()
+        );
+        assert!(
+            builder.disk_data[block_offset + 60..block_offset + BLOCK_SIZE]
+                .iter()
+                .all(|byte| *byte == 0)
+        );
+    }
+
+    #[test]
+    fn symlink_target_may_be_empty_but_must_leave_room_for_nul() {
+        let mut builder = fresh_builder().expect("failed to create builder");
+        let metadata = PosixMetadata::default();
+        let free_inodes = builder.superblock.s_free_inodes_count;
+
+        let ino = builder
+            .add_symlink(EXT4_ROOT_INO, "empty", "", &metadata)
+            .expect("e2fsprogs permits an empty symlink target");
+        let (group, index) = builder.inode_location(ino);
+        let empty_size = builder.groups[group].inode_table[index].i_size_lo;
+        assert_eq!(empty_size, 0);
+
+        assert!(
+            builder
+                .add_symlink(
+                    EXT4_ROOT_INO,
+                    "too-long",
+                    &"x".repeat(BLOCK_SIZE),
+                    &metadata,
+                )
+                .is_err()
+        );
+        let remaining_inodes = builder.superblock.s_free_inodes_count;
+        assert_eq!(remaining_inodes, free_inodes - 1);
     }
 }

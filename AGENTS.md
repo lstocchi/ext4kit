@@ -53,13 +53,16 @@ The library is layered; a module uses only the layers above it:
 | Path | Responsibility |
 |------|----------------|
 | `src/ext4/format/mod.rs` | On-disk structs (`zerocopy`) and constants: `BLOCK_SIZE` = 4096, `INODE_SIZE` = 256, `BLOCKS_PER_GROUP`, inode numbers, file types |
-| `src/ext4/format/dirhash.rs`, `xattr.rs` | The half-MD4 directory hash; external xattr block encoding and POSIX ACL conversion |
-| `src/ext4/mod.rs` | `Ext4ImageBuilder`: layout, bitmaps, block/inode allocation, extent-tree writing, `DiskData` (memory, mmap'd file or read-only copy-on-write) |
+| `src/ext4/format/dirhash.rs`, `xattr.rs` | The half-MD4 directory hash; xattr name parsing, xattr block encoding (`encode_xattr_block`) and POSIX ACL conversion |
+| `src/ext4/mod.rs` | The `Ext4ImageBuilder` struct, `DiskData` (memory, mmap'd file or read-only copy-on-write), constructors, and the `test_support::fresh_builder()` fixture |
+| `src/ext4/layout.rs` | Block-group geometry, root and `lost+found`, serializing superblocks, descriptors, bitmaps and inode tables (`commit_metadata`, `write_to_file`) |
 | `src/ext4/open.rs` | `Ext4ImageBuilder::open` / `open_read_only` / `from_image`: load an existing ext4kit image, rejecting foreign features and inconsistent counters |
-| `src/ext4/directory.rs` | `PosixMetadata`, `mkdir`, dir-entry add/remove/lookup, directory growth, linear-directory cache, inode mode/owner updates (`set_inode_mode`, `set_owner_recursive`) |
+| `src/ext4/allocation.rs` | Block and inode bitmaps: plan, commit and release blocks and inodes, free counts, `ensure_allocation_capacity` |
+| `src/ext4/inode.rs` | `PosixMetadata`, inode table access, mode/owner/metadata updates (`set_inode_mode`, `set_owner_recursive`), writing xattr blocks |
+| `src/ext4/extent.rs` | Reading and validating extent trees, writing them (`write_extent_tree`), the block runs an inode owns |
+| `src/ext4/directory.rs` | `mkdir`, dir-entry add/remove/lookup, recursive removal, directory growth, linear-directory cache |
 | `src/ext4/htree.rs` | Hashed (dx) directory indexes |
 | `src/ext4/file.rs`, `symlink.rs`, `special.rs` | Regular files (streamed from a `Read`, read back with `read_file`, rewritten in place with `replace_file_contents`), symlinks (fast < 60 bytes / slow), device nodes, FIFOs, sockets |
-| `src/ext4/extent.rs`, `allocation.rs` | Reading extent trees, inode lookup/allocation |
 | `src/vfs/resolve.rs` | Path resolution through symlinks, confined to the image root (`resolve_entry`, `resolve_directory`, `resolve_path`), and `ensure_directory` |
 | `src/vfs/edit.rs` | Path-level edits with coreutils semantics (`remove_path`, `make_directory`, `chmod_path`, `chown_path`, `write_path`, `test_path`, ...) behind `ext4kit edit` |
 | `src/host/` | Host directory import (`dua-core` walk) and sizing; `tree.rs` is the pre-scanned `HostTree` arena |
@@ -117,7 +120,7 @@ streaming import design.
   the library, and `edit.rs` runs sequences of `ext4kit edit` calls.
 - Build small images in memory with `Ext4ImageBuilder::new(16)`, then call
   `create_root_dir()`, `create_lost_and_found()` and `reserve_inodes()`
-  (see `fresh_builder()` in `ext4/directory.rs`). Assert by reading back
+  (`ext4::test_support::fresh_builder()` does this). Assert by reading back
   through the builder (`lookup_dir_entry`, `inode`, `directory_entries`,
   `get_dir_blocks`) and by comparing free counts before and after.
 - OCI tests build synthetic tar/gzip layers in memory (`layer()` helper in

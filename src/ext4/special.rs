@@ -1,8 +1,9 @@
-//! Extracted core filesystem operations.
+//! Special inodes: character and block devices, FIFOs and sockets.
 
 use super::{
     Ext4ImageBuilder,
-    directory::{PosixMetadata, default_permissions, dir_entry_file_type},
+    directory::dir_entry_file_type,
+    inode::{PosixMetadata, default_permissions},
 };
 use crate::ext4::format::xattr::prepare_xattrs;
 use crate::ext4::format::*;
@@ -110,5 +111,107 @@ impl Ext4ImageBuilder {
             block[4..8].copy_from_slice(&new_dev.to_le_bytes());
         }
         Ok(block)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ext4::test_support::fresh_builder;
+
+    #[test]
+    fn char_and_block_device_nodes_encode_rdev() {
+        let mut builder = fresh_builder().expect("failed to create builder");
+        let metadata = PosixMetadata {
+            mode: Some(0o666),
+            ..Default::default()
+        };
+
+        // Character device with standard minor/major (< 256): /dev/null (1, 3)
+        let chr_ino = builder
+            .add_char_device(EXT4_ROOT_INO, "null", 1, 3, &metadata)
+            .expect("failed to create char device");
+        let (group, idx) = builder.inode_location(chr_ino);
+        let chr = &builder.groups[group].inode_table[idx];
+
+        let chr_mode = chr.i_mode;
+        let chr_size = chr.i_size_lo;
+        let chr_blocks = chr.i_blocks_lo;
+        let chr_flags = chr.i_flags;
+        let chr_block = chr.i_block;
+        assert_eq!(chr_mode, S_IFCHR | 0o666);
+        assert_eq!(chr_size, 0);
+        assert_eq!(chr_blocks, 0);
+        assert_eq!(chr_flags, 0); // Must NOT have EXT4_EXTENTS_FL
+        let dev_lo = u32::from_le_bytes(chr_block[..4].try_into().unwrap());
+        assert_eq!(dev_lo, (1 << 8) | 3);
+
+        // Block device with high major/minor (>= 256): (259, 1)
+        let blk_ino = builder
+            .add_block_device(EXT4_ROOT_INO, "nvme0n1", 259, 1, &metadata)
+            .expect("failed to create block device");
+        let (b_group, b_idx) = builder.inode_location(blk_ino);
+        let blk = &builder.groups[b_group].inode_table[b_idx];
+
+        let blk_mode = blk.i_mode;
+        let blk_size = blk.i_size_lo;
+        let blk_blocks = blk.i_blocks_lo;
+        let blk_flags = blk.i_flags;
+        assert_eq!(blk_mode, S_IFBLK | 0o666);
+        assert_eq!(blk_size, 0);
+        assert_eq!(blk_blocks, 0);
+        assert_eq!(blk_flags, 0);
+        // High device numbers leave i_block[0] as 0 and set i_block[1]
+        let dev_old = u32::from_le_bytes(blk.i_block[..4].try_into().unwrap());
+        let dev_new = u32::from_le_bytes(blk.i_block[4..8].try_into().unwrap());
+        assert_eq!(dev_old, 0);
+        let expected_new = (1 & 0xff) | (259 << 8);
+        assert_eq!(dev_new, expected_new);
+    }
+
+    #[test]
+    fn fifo_and_socket_nodes() {
+        let mut builder = fresh_builder().expect("failed to create builder");
+        let metadata = PosixMetadata::default();
+
+        let fifo_ino = builder
+            .add_fifo(EXT4_ROOT_INO, "test_pipe", &metadata)
+            .expect("failed to create fifo");
+        let (f_grp, f_idx) = builder.inode_location(fifo_ino);
+        let fifo = &builder.groups[f_grp].inode_table[f_idx];
+
+        let fifo_mode = fifo.i_mode;
+        let fifo_size = fifo.i_size_lo;
+        let fifo_blocks = fifo.i_blocks_lo;
+        let fifo_flags = fifo.i_flags;
+        let fifo_block = fifo.i_block;
+        assert_eq!(fifo_mode, S_IFIFO | 0o644);
+        assert_eq!(fifo_size, 0);
+        assert_eq!(fifo_blocks, 0);
+        assert_eq!(fifo_flags, 0);
+        assert_eq!(fifo_block, [0u8; 60]);
+
+        let sock_ino = builder
+            .add_socket(EXT4_ROOT_INO, "test.sock", &metadata)
+            .expect("failed to create socket");
+        let (s_grp, s_idx) = builder.inode_location(sock_ino);
+        let sock = &builder.groups[s_grp].inode_table[s_idx];
+
+        let sock_mode = sock.i_mode;
+        let sock_size = sock.i_size_lo;
+        let sock_blocks = sock.i_blocks_lo;
+        let sock_flags = sock.i_flags;
+        let sock_block = sock.i_block;
+        assert_eq!(sock_mode, S_IFSOCK | 0o777);
+        assert_eq!(sock_size, 0);
+        assert_eq!(sock_blocks, 0);
+        assert_eq!(sock_flags, 0);
+        assert_eq!(sock_block, [0u8; 60]);
+    }
+
+    #[test]
+    fn device_numbers_must_fit_linux_dev_t() {
+        assert!(Ext4ImageBuilder::encode_device_number(0x1000, 0).is_err());
+        assert!(Ext4ImageBuilder::encode_device_number(0, 0x10_0000).is_err());
     }
 }

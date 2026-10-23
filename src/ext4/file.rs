@@ -1,9 +1,10 @@
-//! Extracted core filesystem operations.
+//! Regular files: creation from a reader, reading back and in-place
+//! content replacement.
 
 use super::{
     Ext4ImageBuilder,
-    directory::PosixMetadata,
     extent::{EXT_INIT_MAX_LEN, extent_len, extents_for_runs},
+    inode::PosixMetadata,
 };
 use crate::ext4::format::xattr::prepare_xattrs;
 use crate::ext4::format::*;
@@ -248,18 +249,12 @@ impl Ext4ImageBuilder {
 #[cfg(test)]
 mod tests {
     use crate::ext4::format::*;
+    use crate::ext4::test_support::fresh_builder;
     use crate::ext4::{Ext4ImageBuilder, PosixMetadata};
     use anyhow::Result;
     use std::collections::HashMap;
     use std::io::{Read, repeat};
-
-    fn builder() -> Result<Ext4ImageBuilder> {
-        let mut builder = Ext4ImageBuilder::new(16);
-        builder.create_root_dir()?;
-        builder.create_lost_and_found()?;
-        builder.reserve_inodes();
-        Ok(builder)
-    }
+    use zerocopy::FromBytes;
 
     fn contents(builder: &Ext4ImageBuilder, ino: u32) -> Vec<u8> {
         let mut data = Vec::new();
@@ -281,7 +276,7 @@ mod tests {
 
     #[test]
     fn replacing_contents_keeps_the_inode_and_its_metadata() -> Result<()> {
-        let mut builder = builder()?;
+        let mut builder = fresh_builder()?;
         let meta = PosixMetadata {
             mode: Some(0o640),
             uid: 0,
@@ -327,7 +322,7 @@ mod tests {
 
     #[test]
     fn replacing_contents_can_spread_over_reclaimed_holes() -> Result<()> {
-        let mut builder = builder()?;
+        let mut builder = fresh_builder()?;
         let meta = PosixMetadata::default();
         let dir = builder.mkdir(EXT4_ROOT_INO, "holes", None)?;
         for index in 0..40 {
@@ -357,7 +352,7 @@ mod tests {
 
     #[test]
     fn reused_blocks_do_not_leak_old_data_past_the_end_of_a_file() -> Result<()> {
-        let mut builder = builder()?;
+        let mut builder = fresh_builder()?;
         let meta = PosixMetadata::default();
         builder.add_file(EXT4_ROOT_INO, "secret", &[0xAA; BLOCK_SIZE], &meta)?;
         builder.remove_dir_entry(EXT4_ROOT_INO, "secret")?;
@@ -377,7 +372,7 @@ mod tests {
 
     #[test]
     fn failed_replace_preflight_leaves_the_file_unchanged() -> Result<()> {
-        let mut builder = builder()?;
+        let mut builder = fresh_builder()?;
         let file = builder.add_file(EXT4_ROOT_INO, "f", b"original", &PosixMetadata::default())?;
         let inode = *builder.inode(file);
         let counts = free_counts(&builder);
@@ -407,7 +402,7 @@ mod tests {
 
     #[test]
     fn failed_add_file_reader_leaves_counts_unchanged() -> Result<()> {
-        let mut builder = builder()?;
+        let mut builder = fresh_builder()?;
         let counts = free_counts(&builder);
         let meta = PosixMetadata::default();
         let result = builder.add_file_from_reader(EXT4_ROOT_INO, "f", &b"short"[..], 100, &meta);
@@ -419,9 +414,46 @@ mod tests {
 
     #[test]
     fn reading_a_non_regular_file_fails() -> Result<()> {
-        let builder = builder()?;
+        let builder = fresh_builder()?;
         assert!(builder.read_file(EXT4_ROOT_INO, &mut Vec::new()).is_err());
         assert!(builder.read_file(9999, &mut Vec::new()).is_err());
         Ok(())
+    }
+
+    #[test]
+    fn file_is_linked_and_uses_contiguous_extent_and_xattrs() {
+        let mut builder = fresh_builder().expect("failed to create builder");
+        let mut metadata = PosixMetadata {
+            mode: Some(0o640),
+            uid: 70_000,
+            gid: 80_000,
+            mtime: 42,
+            ..Default::default()
+        };
+        metadata
+            .xattrs
+            .insert("user.note".into(), b"metadata".to_vec());
+        let ino = builder
+            .add_file(EXT4_ROOT_INO, "payload", &[7; BLOCK_SIZE + 10], &metadata)
+            .expect("failed to add file");
+        let (group, index) = builder.inode_location(ino);
+        let inode = &builder.groups[group].inode_table[index];
+        let mode = inode.i_mode;
+        let size = inode.i_size_lo;
+        let sectors = inode.i_blocks_lo;
+        let xattr_block = inode.i_file_acl_lo;
+        assert_eq!(mode, S_IFREG | 0o640);
+        assert_eq!(size, (BLOCK_SIZE + 10) as u32);
+        assert_eq!(sectors, 24); // two payload blocks plus one xattr block, in sectors
+        assert_ne!(xattr_block, 0);
+        let extent = Ext4Extent::read_from_bytes(&inode.i_block[12..24]).unwrap();
+        let extent_len = extent.ee_len;
+        let extent_start = extent.ee_start_lo;
+        assert_eq!(extent_len, 2);
+        assert_eq!(
+            &builder.disk_data[extent_start as usize * BLOCK_SIZE
+                ..extent_start as usize * BLOCK_SIZE + BLOCK_SIZE + 10],
+            &[7; BLOCK_SIZE + 10]
+        );
     }
 }

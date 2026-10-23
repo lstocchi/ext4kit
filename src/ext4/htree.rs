@@ -553,3 +553,92 @@ impl Ext4ImageBuilder {
         Ok(found)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ext4::PosixMetadata;
+    use crate::ext4::test_support::fresh_builder;
+
+    #[test]
+    fn htree_lookup_follows_collision_continuation_leaf() {
+        let mut builder = fresh_builder().unwrap();
+        let directory = builder.mkdir(EXT4_ROOT_INO, "collisions", None).unwrap();
+        let meta = PosixMetadata::default();
+        for file_idx in 0..220 {
+            builder
+                .add_file(directory, &format!("file_{file_idx:07}"), b"", &meta)
+                .unwrap();
+        }
+
+        let blocks = builder.get_dir_blocks(directory).unwrap();
+        let name = "collision-target";
+        let hash = builder.dir_hash(name.as_bytes());
+        builder
+            .write_dir_leaf(
+                blocks[1],
+                &[super::super::htree::HtreeEntry {
+                    hash: 0,
+                    inode: 100,
+                    file_type: EXT4_FT_REG_FILE,
+                    name: b"other".to_vec(),
+                }],
+            )
+            .unwrap();
+        builder
+            .write_dir_leaf(
+                blocks[2],
+                &[super::super::htree::HtreeEntry {
+                    hash,
+                    inode: 101,
+                    file_type: EXT4_FT_REG_FILE,
+                    name: name.as_bytes().to_vec(),
+                }],
+            )
+            .unwrap();
+        builder
+            .write_dx_root(directory, EXT4_ROOT_INO, 0, &[(0, 1), (hash | 1, 2)])
+            .unwrap();
+
+        assert!(builder.find_htree_slot(directory, name).is_err());
+    }
+
+    #[test]
+    fn full_dx_root_is_promoted_to_indirect_node() {
+        let mut builder = fresh_builder().unwrap();
+        let directory = builder.mkdir(EXT4_ROOT_INO, "promotion", None).unwrap();
+        let meta = PosixMetadata::default();
+        for file_idx in 0..220 {
+            builder
+                .add_file(directory, &format!("file_{file_idx:07}"), b"", &meta)
+                .unwrap();
+        }
+
+        let blocks = builder.get_dir_blocks(directory).unwrap();
+        let full_leaf: Vec<_> = (0..204)
+            .map(|i| {
+                let name = format!("e{i:011}").into_bytes();
+                super::super::htree::HtreeEntry {
+                    hash: builder.dir_hash(&name),
+                    inode: 100 + i,
+                    file_type: EXT4_FT_REG_FILE,
+                    name,
+                }
+            })
+            .collect();
+        builder.write_dir_leaf(blocks[1], &full_leaf).unwrap();
+        let root_entries = vec![(0, 1); (BLOCK_SIZE - 32) / 8];
+        builder
+            .write_dx_root(directory, EXT4_ROOT_INO, 0, &root_entries)
+            .unwrap();
+
+        builder
+            .split_htree_leaf_and_insert(directory, "new_entry", 999, EXT4_FT_REG_FILE)
+            .unwrap();
+
+        let root_block = builder.get_dir_blocks(directory).unwrap()[0] as usize * BLOCK_SIZE;
+        assert_eq!(builder.disk_data[root_block + 30], 1);
+        let root = builder.read_dx_entries(directory).unwrap();
+        assert_eq!(root, vec![(0, 4)]);
+    }
+}
