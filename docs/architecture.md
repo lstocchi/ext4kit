@@ -26,4 +26,13 @@ When the caller supplies the image size, the sizing arena is unnecessary.
 map from live directory IDs to ext4 inode numbers. The CLI selects this path
 with `create --size MIB`.
 
+`Ext4ImageBuilder::open` maps an existing image and loads its superblock,
+group descriptors, bitmaps and inode tables back into the builder, so the
+same operations can edit an image in place. Because `write_to_file` rewrites
+all metadata from the builder's model, `open` accepts only images in
+ext4kit's own format: the exact feature set it writes, 4 KiB blocks, 256-byte
+inodes, no reserved GDT blocks, a clean state and counters that match the
+bitmaps. Images made by `mke2fs` (journal, `flex_bg`, `64bit`, checksums) are
+rejected rather than silently stripped of metadata.
+
 An agent harness will become a sibling component to `core` when concrete functionality exists.

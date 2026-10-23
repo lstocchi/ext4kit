@@ -45,6 +45,7 @@ well.
 | `src/core/directory.rs` | `PosixMetadata`, `mkdir`, dir-entry add/remove/lookup, directory growth, linear-directory cache |
 | `src/core/htree.rs`, `dirhash.rs` | Hashed (dx) directory indexes and the half-MD4 hash |
 | `src/core/file.rs`, `symlink.rs`, `special.rs` | Regular files (streamed from a `Read`), symlinks (fast < 60 bytes / slow), device nodes, FIFOs, sockets |
+| `src/core/open.rs` | `Ext4ImageBuilder::open` / `from_image`: load an existing ext4kit image for in-place edits, rejecting foreign features and inconsistent counters |
 | `src/core/extent.rs`, `allocation.rs`, `path.rs` | Reading extent trees, inode lookup/allocation, path resolution and `ensure_directory` |
 | `src/xattr.rs` | External xattr block encoding, POSIX ACL conversion |
 | `src/host/` | Host directory import (`dua-core` walk) and sizing; `tree.rs` is the pre-scanned `HostTree` arena |

@@ -18,6 +18,7 @@ pub mod dirhash;
 mod extent;
 mod file;
 mod htree;
+mod open;
 mod path;
 mod special;
 mod symlink;
@@ -688,24 +689,7 @@ impl Ext4ImageBuilder {
     /// Flushes Superblock and Group Descriptors into disk_data, then writes to file
     /// Finalizes metadata and writes the image to `output_path`; returns I/O success or failure.
     pub fn write_to_file(&mut self, output_path: &str) -> std::io::Result<()> {
-        // Commit Inode Tables
-        self.write_inode_table();
-        // Write the primary metadata and all sparse-super backups.  Each
-        // backup superblock records the group where it resides.
-        for group_idx in 0..self.groups.len() {
-            if Self::group_has_super(group_idx) {
-                self.write_superblock_and_gdt(group_idx);
-            }
-        }
-        // Commit Block & Inode Bitmaps into disk_data
-        for (i, group) in self.groups.iter().enumerate() {
-            let bb_offset = (self.group_descriptors[i].bg_block_bitmap_lo as usize) * BLOCK_SIZE;
-            self.disk_data[bb_offset..bb_offset + group.block_bitmap.len()]
-                .copy_from_slice(&group.block_bitmap);
-            let ib_offset = (self.group_descriptors[i].bg_inode_bitmap_lo as usize) * BLOCK_SIZE;
-            self.disk_data[ib_offset..ib_offset + group.inode_bitmap.len()]
-                .copy_from_slice(&group.inode_bitmap);
-        }
+        self.commit_metadata();
         // Flush file-backed pages, or write the compatibility in-memory image.
         match &mut self.disk_data {
             DiskData::Memory(data) => {
@@ -726,6 +710,29 @@ impl Ext4ImageBuilder {
             }
         }
         Ok(())
+    }
+
+    /// Serializes the inode tables, superblocks, group descriptors and
+    /// bitmaps held in memory into `disk_data`.
+    pub(crate) fn commit_metadata(&mut self) {
+        // Commit Inode Tables
+        self.write_inode_table();
+        // Write the primary metadata and all sparse-super backups.  Each
+        // backup superblock records the group where it resides.
+        for group_idx in 0..self.groups.len() {
+            if Self::group_has_super(group_idx) {
+                self.write_superblock_and_gdt(group_idx);
+            }
+        }
+        // Commit Block & Inode Bitmaps into disk_data
+        for (i, group) in self.groups.iter().enumerate() {
+            let bb_offset = (self.group_descriptors[i].bg_block_bitmap_lo as usize) * BLOCK_SIZE;
+            self.disk_data[bb_offset..bb_offset + group.block_bitmap.len()]
+                .copy_from_slice(&group.block_bitmap);
+            let ib_offset = (self.group_descriptors[i].bg_inode_bitmap_lo as usize) * BLOCK_SIZE;
+            self.disk_data[ib_offset..ib_offset + group.inode_bitmap.len()]
+                .copy_from_slice(&group.inode_bitmap);
+        }
     }
 
     /// Calculate maximum metadata blocks required for an extent tree.

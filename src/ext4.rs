@@ -62,11 +62,14 @@ pub const S_IFMT: u16 = 0xF000; // File type mask
 pub const EXT4_LINK_MAX: u16 = 65000;
 
 // Feature Flags
+pub const EXT4_BG_INODE_UNINIT: u16 = 0x0001;
+pub const EXT4_BG_BLOCK_UNINIT: u16 = 0x0002;
 pub const EXT4_BG_INODE_ZEROED: u16 = 0x0004;
 pub const EXT4_FEATURE_INCOMPAT_FILETYPE: u32 = 0x0002;
 pub const EXT4_FEATURE_INCOMPAT_EXTENTS: u32 = 0x0040;
 pub const EXT4_FEATURE_COMPAT_EXT_ATTR: u32 = 0x0008;
 pub const EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
+pub const EXT4_FEATURE_RO_COMPAT_LARGE_FILE: u32 = 0x0002;
 pub const EXT4_FEATURE_RO_COMPAT_DIR_NLINK: u32 = 0x0020;
 /// Metadata checksum features are intentionally unsupported: corresponding
 /// superblock feature flags stay clear and checksum fields remain zero.
@@ -75,8 +78,16 @@ pub const EXT4_FEATURE_RO_COMPAT_METADATA_CSUM: u32 = 0x0400;
 pub const EXT4_FEATURE_COMPAT_DIR_INDEX: u32 = 0x0020;
 pub const EXT4_INDEX_FL: u32 = 0x0000_1000;
 
+// Superblock state and flags
+pub const EXT2_VALID_FS: u16 = 0x0001;
+pub const EXT2_ERROR_FS: u16 = 0x0002;
+/// Byte offset of `s_flags` inside the superblock. The field lies in the
+/// part of [`Ext4SuperBlock`] that is kept as opaque padding.
+pub const EXT4_SUPERBLOCK_FLAGS_OFFSET: usize = 0x160;
+pub const EXT2_FLAGS_UNSIGNED_HASH: u32 = 0x0002;
+
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug, Immutable, IntoBytes, KnownLayout)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes, KnownLayout)]
 pub struct Ext4SuperBlock {
     pub s_inodes_count: u32,
     pub s_blocks_count_lo: u32,
@@ -192,7 +203,7 @@ impl Default for Ext4SuperBlock {
 }
 
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug, Default, Immutable, IntoBytes, KnownLayout)]
+#[derive(Clone, Copy, Debug, Default, FromBytes, Immutable, IntoBytes, KnownLayout)]
 pub struct Ext4GroupDesc {
     pub bg_block_bitmap_lo: u32,
     pub bg_inode_bitmap_lo: u32,
