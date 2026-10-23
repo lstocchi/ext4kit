@@ -10,13 +10,30 @@ const EXT4_MAX_EXTENT_DEPTH: u16 = 5;
 
 /// Initialized extents are at most 32,768 blocks long; larger `ee_len`
 /// values encode an uninitialized extent of `ee_len - 32768` blocks.
-const EXT_INIT_MAX_LEN: u16 = 1 << 15;
+pub(super) const EXT_INIT_MAX_LEN: u16 = 1 << 15;
 
 /// Leaf extents and external index/leaf blocks reachable from an inode.
 #[derive(Default)]
 pub(crate) struct ExtentTree {
     pub(crate) leaves: Vec<Ext4Extent>,
     pub(crate) tree_blocks: Vec<u32>,
+}
+
+/// Builds initialized leaf extents from physical runs, assigning consecutive logical blocks.
+pub(super) fn extents_for_runs(runs: &[(u32, u32)]) -> Vec<Ext4Extent> {
+    let mut logical = 0u32;
+    runs.iter()
+        .map(|&(start, len)| {
+            let extent = Ext4Extent {
+                ee_block: logical,
+                ee_len: len as u16,
+                ee_start_hi: 0,
+                ee_start_lo: start,
+            };
+            logical += len;
+            extent
+        })
+        .collect()
 }
 
 /// Returns the number of blocks mapped by `extent`, initialized or not.

@@ -96,6 +96,15 @@ impl Ext4ImageBuilder {
             .filter(|&inode| self.is_directory(inode)))
     }
 
+    /// Resolves an absolute image path to an existing entry of any type,
+    /// following every symlink including a final one, as stat(2) does inside
+    /// a chroot.  Returns `None` when a component is missing or a symlink
+    /// dangles.
+    pub fn resolve_path(&self, path: &str) -> Result<Option<u32>> {
+        let resolved = self.walk_path(vec![EXT4_ROOT_INO], path, &mut 0)?;
+        Ok(resolved.and_then(|chain| chain.last().copied()))
+    }
+
     /// Resolves the parent directories of `path` through symlinks and looks
     /// up its final component without following it.
     pub fn resolve_entry(&self, path: &str) -> Result<Option<u32>> {
@@ -234,6 +243,29 @@ mod tests {
         assert!(builder.ensure_directory("/etc/app", false).is_err());
         let app = builder.ensure_directory("/etc/app", true)?;
         assert_eq!(builder.resolve_directory("/etc/app")?, Some(app));
+        Ok(())
+    }
+
+    #[test]
+    fn resolve_path_follows_final_symlinks_inside_the_image() -> Result<()> {
+        let mut builder = builder()?;
+        let meta = PosixMetadata::default();
+        let usr = builder.mkdir(EXT4_ROOT_INO, "usr", None)?;
+        let usr_bin = builder.mkdir(usr, "bin", None)?;
+        let bash = builder.add_file(usr_bin, "bash", b"elf", &meta)?;
+        builder.add_symlink(EXT4_ROOT_INO, "bin", "usr/bin", &meta)?;
+        // Absolute targets resolve against the image root, as in a chroot.
+        let sh = builder.add_symlink(usr_bin, "sh", "/bin/bash", &meta)?;
+        builder.add_symlink(usr_bin, "dangling", "missing", &meta)?;
+
+        assert_eq!(builder.resolve_path("/bin/bash")?, Some(bash));
+        assert_eq!(builder.resolve_path("/bin/sh")?, Some(bash));
+        assert_eq!(builder.resolve_path("/bin")?, Some(usr_bin));
+        assert_eq!(builder.resolve_path("/")?, Some(EXT4_ROOT_INO));
+        assert_eq!(builder.resolve_path("/bin/dangling")?, None);
+        assert_eq!(builder.resolve_path("/bin/bash/x")?, None);
+        // resolve_entry keeps the final symlink itself.
+        assert_eq!(builder.resolve_entry("/bin/sh")?, Some(sh));
         Ok(())
     }
 }

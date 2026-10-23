@@ -59,6 +59,74 @@ fn reopened_image_stays_clean_after_edits() {
 }
 
 #[test]
+fn edit_primitives_on_a_reopened_image_stay_clean() {
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("src");
+    fs::create_dir_all(src.join("holes")).unwrap();
+    for index in 0..60 {
+        fs::write(src.join(format!("holes/{index:02}")), [b'h'; 4096]).unwrap();
+    }
+    fs::create_dir_all(src.join("etc")).unwrap();
+    fs::write(src.join("etc/passwd"), "root:x:0:0::/root:/bin/sh\n").unwrap();
+    fs::create_dir_all(src.join("bin")).unwrap();
+    fs::write(src.join("bin/tool"), "#!/bin/sh\n").unwrap();
+    fs::create_dir_all(src.join("sandbox/nested")).unwrap();
+    fs::write(src.join("sandbox/nested/file"), "data").unwrap();
+    let out = tmp.path().join("out.img");
+    // Pin ownership so the assertions below do not depend on the host user.
+    create(
+        &["--chown", "0:0", "--add", &format!("{}:/", arg(&src))],
+        &out,
+    );
+
+    // Large enough to need an external extent leaf once it is spread over
+    // the one-block holes left by the removals below.
+    let passwd: String = (0..2000)
+        .map(|index| format!("user{index:04}:x:{index}:{index}::/home:/bin/sh\n"))
+        .collect();
+    {
+        let mut builder = Ext4ImageBuilder::open(&out).unwrap();
+        let holes = builder.resolve_directory("/src/holes").unwrap().unwrap();
+        for index in (0..60).step_by(2) {
+            assert!(
+                builder
+                    .remove_dir_entry(holes, &format!("{index:02}"))
+                    .unwrap()
+            );
+        }
+        let file = builder.resolve_path("/src/etc/passwd").unwrap().unwrap();
+        builder
+            .replace_file_contents(file, passwd.as_bytes(), passwd.len() as u64)
+            .unwrap();
+        let tool = builder.resolve_path("/src/bin/tool").unwrap().unwrap();
+        builder.set_inode_mode(tool, 0o755).unwrap();
+        let sandbox = builder.resolve_directory("/src/sandbox").unwrap().unwrap();
+        builder
+            .add_symlink(sandbox, "etc-link", "/src/etc", &PosixMetadata::default())
+            .unwrap();
+        builder.set_owner_recursive(sandbox, 1000, 1000).unwrap();
+        builder.write_to_file(out.to_str().unwrap()).unwrap();
+    }
+
+    let Some(image) = Image::check(&out) else {
+        return;
+    };
+    assert_eq!(image.cat("/src/etc/passwd"), passwd);
+    assert!(image.stat("/src/etc/passwd").contains("(ETB0)"));
+    assert_eq!(image.mode("/src/bin/tool"), 0o755);
+    for path in [
+        "/src/sandbox",
+        "/src/sandbox/nested",
+        "/src/sandbox/nested/file",
+        "/src/sandbox/etc-link",
+    ] {
+        assert_eq!(image.owner(path), (1000, 1000), "{path}");
+    }
+    assert_eq!(image.owner("/src/etc"), (0, 0));
+    assert_eq!(image.owner("/src/etc/passwd"), (0, 0));
+}
+
+#[test]
 fn reopening_rejects_a_file_that_is_not_an_ext4kit_image() {
     let tmp = TempDir::new().unwrap();
     let out = tmp.path().join("not-ext4.img");

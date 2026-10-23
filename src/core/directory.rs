@@ -142,6 +142,56 @@ impl Ext4ImageBuilder {
         Ok(())
     }
 
+    /// Replaces only an inode's permission bits (including setuid, setgid
+    /// and sticky), like chmod(2).  The file type, ownership, timestamps and
+    /// xattrs are kept.
+    pub fn set_inode_mode(&mut self, ino: u32, permissions: u16) -> Result<()> {
+        if permissions & !0o7777 != 0 {
+            return Err(anyhow::anyhow!(
+                "mode {permissions:o} has bits outside the permission mask 7777"
+            ));
+        }
+        if !self.is_inode_allocated(ino) {
+            return Err(anyhow::anyhow!("inode {ino} does not exist"));
+        }
+        let inode = self.inode_mut(ino);
+        inode.i_mode = (inode.i_mode & S_IFMT) | permissions;
+        Ok(())
+    }
+
+    /// Sets the ownership of `root` and everything below it, like
+    /// `chown -R -P`: symlinks are changed themselves and never followed, so
+    /// the walk cannot leave the subtree.  Returns the number of inodes
+    /// changed.  The subtree is validated before any owner changes.
+    pub fn set_owner_recursive(&mut self, root: u32, uid: u32, gid: u32) -> Result<usize> {
+        if !self.is_inode_allocated(root) {
+            return Err(anyhow::anyhow!("inode {root} does not exist"));
+        }
+        // An explicit stack keeps deep trees off the call stack; the set
+        // visits each hard-linked inode once.
+        let mut pending = vec![root];
+        let mut seen = HashSet::from([root]);
+        while let Some(inode) = pending.pop() {
+            if !self.inode(inode).is_dir() {
+                continue;
+            }
+            for (_, child) in self.directory_entries(inode)? {
+                if !self.is_inode_allocated(child) {
+                    return Err(anyhow::anyhow!(
+                        "directory inode {inode} references free inode {child}"
+                    ));
+                }
+                if seen.insert(child) {
+                    pending.push(child);
+                }
+            }
+        }
+        for &inode in &seen {
+            Self::populate_inode_owner(self.inode_mut(inode), uid, gid);
+        }
+        Ok(seen.len())
+    }
+
     /// Parses one directory block, rejecting records that
     /// ext2fs_process_dir_block() treats as EXT2_ET_DIR_CORRUPTED.
     pub(crate) fn dir_block_records(&self, block: u32) -> Result<Vec<DirRecord>> {
@@ -938,6 +988,112 @@ mod tests {
         builder.create_lost_and_found()?;
         builder.reserve_inodes();
         Ok(builder)
+    }
+
+    /// Returns `(uid, gid)` including the high 16 bits kept in `i_osd2`.
+    fn owner(builder: &Ext4ImageBuilder, ino: u32) -> (u32, u32) {
+        let inode = builder.inode(ino);
+        let high =
+            |at: usize| u32::from(u16::from_le_bytes([inode.i_osd2[at], inode.i_osd2[at + 1]]));
+        (
+            u32::from(inode.i_uid) | high(4) << 16,
+            u32::from(inode.i_gid) | high(6) << 16,
+        )
+    }
+
+    #[test]
+    fn set_inode_mode_changes_only_permission_bits() -> Result<()> {
+        let mut builder = fresh_builder()?;
+        let meta = PosixMetadata {
+            mode: Some(0o600),
+            uid: 7,
+            gid: 8,
+            atime: 1,
+            ctime: 2,
+            mtime: 3,
+            xattrs: HashMap::from([("user.tag".to_owned(), b"v".to_vec())]),
+        };
+        let file = builder.add_file(EXT4_ROOT_INO, "tool", b"#!/bin/sh\n", &meta)?;
+        let before = *builder.inode(file);
+
+        builder.set_inode_mode(file, 0o4755)?;
+
+        let mut expected = before;
+        expected.i_mode = S_IFREG | 0o4755;
+        assert_eq!(builder.inode(file).as_bytes(), expected.as_bytes());
+        Ok(())
+    }
+
+    #[test]
+    fn failed_set_inode_mode_leaves_the_inode_unchanged() -> Result<()> {
+        let mut builder = fresh_builder()?;
+        let before = *builder.inode(EXT4_ROOT_INO);
+        assert!(
+            builder
+                .set_inode_mode(EXT4_ROOT_INO, S_IFREG | 0o755)
+                .is_err()
+        );
+        assert!(builder.set_inode_mode(9999, 0o755).is_err());
+        assert_eq!(builder.inode(EXT4_ROOT_INO).as_bytes(), before.as_bytes());
+        Ok(())
+    }
+
+    #[test]
+    fn set_owner_recursive_changes_symlinks_without_following_them() -> Result<()> {
+        let mut builder = fresh_builder()?;
+        let meta = PosixMetadata::default();
+        let etc = builder.mkdir(EXT4_ROOT_INO, "etc", None)?;
+        let passwd = builder.add_file(etc, "passwd", b"root:x:0:0::/root:/bin/sh\n", &meta)?;
+        let sandbox = builder.mkdir(EXT4_ROOT_INO, "sandbox", None)?;
+        let nested = builder.mkdir(sandbox, "nested", None)?;
+        let file = builder.add_file(nested, "file", b"data", &meta)?;
+        let link = builder.add_symlink(sandbox, "etc-link", "/etc", &meta)?;
+        let escape = builder.add_symlink(sandbox, "passwd-link", "../etc/passwd", &meta)?;
+        // A hard link inside the subtree shares its inode with the outside.
+        builder.add_hard_link(sandbox, "hard", file)?;
+
+        let changed = builder.set_owner_recursive(sandbox, 100_000, 1000)?;
+
+        assert_eq!(changed, 5);
+        for inode in [sandbox, nested, file, link, escape] {
+            assert_eq!(owner(&builder, inode), (100_000, 1000));
+        }
+        for inode in [EXT4_ROOT_INO, etc, passwd] {
+            assert_eq!(owner(&builder, inode), (0, 0));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn set_owner_recursive_on_a_symlink_changes_only_the_link() -> Result<()> {
+        let mut builder = fresh_builder()?;
+        let meta = PosixMetadata::default();
+        let etc = builder.mkdir(EXT4_ROOT_INO, "etc", None)?;
+        let link = builder.add_symlink(EXT4_ROOT_INO, "sandbox", "/etc", &meta)?;
+
+        assert_eq!(builder.set_owner_recursive(link, 1000, 1000)?, 1);
+        assert_eq!(owner(&builder, link), (1000, 1000));
+        assert_eq!(owner(&builder, etc), (0, 0));
+        Ok(())
+    }
+
+    #[test]
+    fn failed_set_owner_recursive_preflight_changes_nothing() -> Result<()> {
+        let mut builder = fresh_builder()?;
+        let meta = PosixMetadata::default();
+        let sandbox = builder.mkdir(EXT4_ROOT_INO, "sandbox", None)?;
+        let first = builder.add_file(sandbox, "a", b"a", &meta)?;
+        let broken = builder.mkdir(sandbox, "broken", None)?;
+        // A directory without extents cannot be listed, so the walk fails
+        // after it has already seen some entries.
+        builder.inode_mut(broken).i_flags &= !EXT4_EXTENTS_FL;
+
+        assert!(builder.set_owner_recursive(sandbox, 1000, 1000).is_err());
+        for inode in [sandbox, first, broken] {
+            assert_eq!(owner(&builder, inode), (0, 0));
+        }
+        assert!(builder.set_owner_recursive(9999, 1000, 1000).is_err());
+        Ok(())
     }
 
     #[test]
