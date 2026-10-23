@@ -2,7 +2,7 @@
 //! be edited in place.
 
 use super::{DiskData, Ext4ImageBuilder};
-use crate::ext4::*;
+use crate::ext4::format::*;
 use anyhow::{Result, anyhow, bail};
 use memmap2::MmapOptions;
 use std::{collections::HashMap, fs::OpenOptions, path::Path};
@@ -238,8 +238,8 @@ fn read_superblock(data: &[u8]) -> Result<Ext4SuperBlock> {
 
 #[cfg(test)]
 mod tests {
-    use crate::core::{Ext4ImageBuilder, PosixMetadata};
-    use crate::ext4::*;
+    use crate::ext4::format::*;
+    use crate::ext4::{Ext4ImageBuilder, PosixMetadata};
     use zerocopy::{FromBytes, IntoBytes};
 
     /// Builds a small image with a directory and a file and returns its

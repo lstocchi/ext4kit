@@ -1,14 +1,14 @@
 use clap::{Args, Parser, Subcommand};
 use ext4kit::{
-    core::Ext4ImageBuilder,
-    edit::{EntryAttributes, PathTest},
-    ext4::EXT4_ROOT_INO,
+    ext4::Ext4ImageBuilder,
+    ext4::format::EXT4_ROOT_INO,
     host::HostTree,
     oci::{
         image_size_mib,
         local::{Engine, LocalImage},
         remote::RemoteImage,
     },
+    vfs::edit::{EntryAttributes, PathTest},
 };
 use std::{
     collections::HashSet,

@@ -1,4 +1,6 @@
-use crate::core::dirhash;
+pub mod dirhash;
+pub mod xattr;
+
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 // ============================================================================

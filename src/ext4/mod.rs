@@ -10,16 +10,15 @@ use std::{
 use memmap2::{MmapMut, MmapOptions};
 use zerocopy::IntoBytes;
 
-use crate::ext4::*;
+use crate::ext4::format::*;
 
 mod allocation;
 pub mod directory;
-pub mod dirhash;
 mod extent;
 mod file;
+pub mod format;
 mod htree;
 mod open;
-mod path;
 mod special;
 mod symlink;
 pub use directory::PosixMetadata;
@@ -917,7 +916,7 @@ fn find_next_free_bit(bitmap: &[u8], start: usize, end: usize) -> Option<usize> 
 #[cfg(test)]
 mod bitmap_tests {
     use super::{DiskData, Ext4ImageBuilder, find_next_free_bit};
-    use crate::ext4::{BLOCK_SIZE, INODE_SIZE};
+    use crate::ext4::format::{BLOCK_SIZE, INODE_SIZE};
 
     #[test]
     fn free_bit_search_respects_range_and_bit_order() {

@@ -1,5 +1,5 @@
 use super::Ext4ImageBuilder;
-use crate::ext4::Ext4Inode;
+use crate::ext4::format::Ext4Inode;
 use anyhow::Result;
 
 impl Ext4ImageBuilder {

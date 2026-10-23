@@ -8,8 +8,8 @@
 //! before a failure, like `mkdir -p`.
 
 use crate::{
-    core::{Ext4ImageBuilder, PosixMetadata},
-    ext4::{EXT4_ROOT_INO, S_IFDIR, S_IFLNK, S_IFREG},
+    ext4::format::{EXT4_ROOT_INO, S_IFDIR, S_IFLNK, S_IFREG},
+    ext4::{Ext4ImageBuilder, PosixMetadata},
 };
 use anyhow::{Result, anyhow, bail};
 use std::io::{Read, Write};

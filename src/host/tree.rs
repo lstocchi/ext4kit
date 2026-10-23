@@ -1,8 +1,8 @@
 //! Pre-scanned host-tree snapshot used for image sizing and import.
 
 use crate::{
-    core::{Ext4ImageBuilder, PosixMetadata},
-    ext4::BLOCK_SIZE,
+    ext4::format::BLOCK_SIZE,
+    ext4::{Ext4ImageBuilder, PosixMetadata},
 };
 use anyhow::{Context, Result};
 use std::{

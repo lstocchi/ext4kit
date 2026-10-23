@@ -1,10 +1,10 @@
 use super::Ext4ImageBuilder;
 use super::extent::{ExtentTree, extent_len};
-use crate::ext4::*;
-pub use crate::xattr::parse_xattr_name;
+pub use crate::ext4::format::xattr::parse_xattr_name;
 #[cfg(test)]
-use crate::xattr::posix_acl_to_ext4_disk;
-use crate::xattr::prepare_xattrs;
+use crate::ext4::format::xattr::posix_acl_to_ext4_disk;
+use crate::ext4::format::xattr::prepare_xattrs;
+use crate::ext4::format::*;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use zerocopy::{FromBytes, IntoBytes};

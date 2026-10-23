@@ -1,8 +1,8 @@
 //! Path resolution inside the image, following symlinks like a chrooted
 //! path walk.
 
-use super::{Ext4ImageBuilder, PosixMetadata};
-use crate::ext4::*;
+use crate::ext4::format::*;
+use crate::ext4::{Ext4ImageBuilder, PosixMetadata};
 use anyhow::Result;
 
 /// Linux MAXSYMLINKS: the kernel gives up with ELOOP after 40 links.

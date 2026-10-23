@@ -1,8 +1,8 @@
 //! Import of a flattened root filesystem from a local Podman or Docker engine.
 
 use crate::{
-    core::Ext4ImageBuilder,
-    ext4::EXT4_ROOT_INO,
+    ext4::Ext4ImageBuilder,
+    ext4::format::EXT4_ROOT_INO,
     oci::{LayerCompression, apply_compressed_layer, verify_platform},
 };
 use anyhow::{Context, Result, bail};

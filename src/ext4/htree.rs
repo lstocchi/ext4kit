@@ -2,8 +2,8 @@
 
 use super::Ext4ImageBuilder;
 use super::directory::{DirSlot, align4};
-use crate::core::dirhash;
-use crate::ext4::*;
+use crate::ext4::format::dirhash;
+use crate::ext4::format::*;
 use anyhow::Result;
 use zerocopy::{FromBytes, IntoBytes};
 

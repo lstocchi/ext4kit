@@ -1,7 +1,7 @@
 //! Import of filesystem layers from an OCI registry.
 
 use crate::{
-    core::Ext4ImageBuilder,
+    ext4::Ext4ImageBuilder,
     oci::{
         OCI_SIZE_MULTIPLIER, apply_compressed_layer, image_size_mib, layer_compression,
         verify_platform,

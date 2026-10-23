@@ -5,8 +5,8 @@ use super::{
     directory::PosixMetadata,
     extent::{EXT_INIT_MAX_LEN, extent_len, extents_for_runs},
 };
-use crate::ext4::*;
-use crate::xattr::prepare_xattrs;
+use crate::ext4::format::xattr::prepare_xattrs;
+use crate::ext4::format::*;
 use anyhow::{Result, anyhow, bail};
 use std::io::{Cursor, Read, Write};
 
@@ -247,8 +247,8 @@ impl Ext4ImageBuilder {
 
 #[cfg(test)]
 mod tests {
-    use crate::core::{Ext4ImageBuilder, PosixMetadata};
-    use crate::ext4::*;
+    use crate::ext4::format::*;
+    use crate::ext4::{Ext4ImageBuilder, PosixMetadata};
     use anyhow::Result;
     use std::collections::HashMap;
     use std::io::{Read, repeat};

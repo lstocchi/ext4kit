@@ -1,8 +1,8 @@
 //! Ext4 extended-attribute block encoding and POSIX ACL conversion.
 
 use crate::{
-    core::{Ext4ImageBuilder, directory::PreparedXattr},
-    ext4::*,
+    ext4::format::*,
+    ext4::{Ext4ImageBuilder, directory::PreparedXattr},
 };
 use anyhow::Result;
 use std::collections::HashMap;

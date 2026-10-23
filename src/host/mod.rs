@@ -5,8 +5,8 @@ mod tree;
 pub use tree::HostTree;
 
 use crate::{
-    core::{Ext4ImageBuilder, PosixMetadata},
-    ext4::{BLOCK_SIZE, BLOCKS_PER_GROUP, EXT4_ROOT_INO, INODE_SIZE},
+    ext4::format::{BLOCK_SIZE, BLOCKS_PER_GROUP, EXT4_ROOT_INO, INODE_SIZE},
+    ext4::{Ext4ImageBuilder, PosixMetadata},
 };
 use anyhow::{Context, Result};
 use std::{
@@ -491,7 +491,7 @@ mod tests {
         let (group, index) = builder.inode_location(imported);
         assert_eq!(
             builder.groups[group].inode_table[index].i_mode & 0xf000,
-            crate::ext4::S_IFDIR
+            crate::ext4::format::S_IFDIR
         );
 
         fs::remove_dir_all(base)?;
@@ -532,7 +532,7 @@ mod tests {
         let (group, index) = builder.inode_location(inode);
         assert_eq!(
             builder.groups[group].inode_table[index].i_mode & 0xf000,
-            crate::ext4::S_IFDIR
+            crate::ext4::format::S_IFDIR
         );
 
         fs::remove_dir_all(base)?;
@@ -575,7 +575,10 @@ mod tests {
         let replacement = builder
             .lookup_dir_entry(overlay, "replacement")?
             .expect("overlay should import the replacement file");
-        assert_eq!(builder.inode(replacement).file_type(), crate::ext4::S_IFREG);
+        assert_eq!(
+            builder.inode(replacement).file_type(),
+            crate::ext4::format::S_IFREG
+        );
         assert_eq!({ builder.inode(EXT4_ROOT_INO).i_links_count }, 4);
         assert_eq!({ builder.inode(overlay).i_links_count }, 2);
         assert_eq!({ builder.group_descriptors[0].bg_used_dirs_count_lo }, 3);
@@ -610,7 +613,7 @@ mod tests {
         let (group, index) = builder.inode_location(imported);
         assert_eq!(
             builder.groups[group].inode_table[index].i_mode & 0xf000,
-            crate::ext4::S_IFREG
+            crate::ext4::format::S_IFREG
         );
 
         fs::remove_dir_all(base)?;

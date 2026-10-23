@@ -1,7 +1,7 @@
 //! Extracted core filesystem operations.
 
 use super::Ext4ImageBuilder;
-use crate::ext4::*;
+use crate::ext4::format::*;
 use anyhow::Result;
 use zerocopy::FromBytes;
 

@@ -4,9 +4,9 @@ pub mod local;
 pub mod remote;
 
 use crate::{
-    core::{Ext4ImageBuilder, PosixMetadata},
-    ext4::EXT4_ROOT_INO,
-    xattr::parse_xattr_name,
+    ext4::format::EXT4_ROOT_INO,
+    ext4::format::xattr::parse_xattr_name,
+    ext4::{Ext4ImageBuilder, PosixMetadata},
 };
 use anyhow::{Context, Result};
 use flate2::read::MultiGzDecoder;
@@ -295,8 +295,8 @@ mod tests {
         verify_platform,
     };
     use crate::{
-        core::{Ext4ImageBuilder, PosixMetadata},
-        ext4::{EXT4_ROOT_INO, S_IFBLK},
+        ext4::format::{EXT4_ROOT_INO, S_IFBLK},
+        ext4::{Ext4ImageBuilder, PosixMetadata},
     };
     use flate2::{Compression, write::GzEncoder};
     use std::io::{Cursor, Write};

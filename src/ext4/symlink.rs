@@ -1,8 +1,8 @@
 //! Extracted core filesystem operations.
 
 use super::{Ext4ImageBuilder, directory::PosixMetadata};
-use crate::ext4::*;
-use crate::xattr::prepare_xattrs;
+use crate::ext4::format::xattr::prepare_xattrs;
+use crate::ext4::format::*;
 use anyhow::Result;
 use zerocopy::IntoBytes;
 

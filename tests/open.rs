@@ -4,7 +4,7 @@
 mod common;
 
 use common::{Image, arg, create};
-use ext4kit::{Ext4ImageBuilder, core::PosixMetadata, ext4::EXT4_ROOT_INO};
+use ext4kit::{Ext4ImageBuilder, PosixMetadata, ext4::format::EXT4_ROOT_INO};
 use std::fs;
 use tempfile::TempDir;
 
