@@ -258,7 +258,7 @@ impl Ext4ImageBuilder {
             source,
             threads,
             dua_core::Order::ParentFirst,
-            dua_core::Options::default(),
+            tree::walk_options(),
             |_| true,
         );
         let mut directory_inodes = HashMap::new();
@@ -282,8 +282,6 @@ impl Ext4ImageBuilder {
                 })?;
             Self::validate_name(name)?;
 
-            let std_metadata = fs::symlink_metadata(&path)
-                .with_context(|| format!("cannot inspect host path {}", path.display()))?;
             let file_type = if walked.file_type.is_dir() {
                 HostFileType::Directory
             } else if walked.file_type.is_file() {
@@ -296,12 +294,13 @@ impl Ext4ImageBuilder {
                     path.display()
                 ));
             };
-            let metadata =
-                HostMetadata::from_std(&std_metadata, file_type == HostFileType::Directory);
-            let host_meta = self.with_host_owner(metadata.as_posix());
 
             let inode = match file_type {
                 HostFileType::Directory => {
+                    let std_metadata = fs::symlink_metadata(&path)
+                        .with_context(|| format!("cannot inspect host path {}", path.display()))?;
+                    let host_meta = self
+                        .with_host_owner(HostMetadata::from_std(&std_metadata, true).as_posix());
                     let inode = self.mkdir(parent_inode, name, Some(&host_meta))?;
                     directory_inodes.insert(
                         walked.directory_id.expect("directory entry has an ID"),
@@ -310,9 +309,17 @@ impl Ext4ImageBuilder {
                     inode
                 }
                 HostFileType::File => {
+                    // One open supplies both the metadata and the payload: an
+                    // extra path-based stat is another filter-driver round
+                    // trip per file on Windows, which dominates the import
+                    // time of many-small-file trees.
                     let file = fs::File::open(&path)
                         .with_context(|| format!("cannot open host file {}", path.display()))?;
-
+                    let std_metadata = file
+                        .metadata()
+                        .with_context(|| format!("cannot inspect host file {}", path.display()))?;
+                    let metadata = HostMetadata::from_std(&std_metadata, false);
+                    let host_meta = self.with_host_owner(metadata.as_posix());
                     self.add_file_from_reader(parent_inode, name, file, metadata.size, &host_meta)?
                 }
                 HostFileType::Symlink => {
@@ -324,6 +331,10 @@ impl Ext4ImageBuilder {
                             path.display()
                         )
                     })?;
+                    let std_metadata = fs::symlink_metadata(&path)
+                        .with_context(|| format!("cannot inspect host path {}", path.display()))?;
+                    let host_meta = self
+                        .with_host_owner(HostMetadata::from_std(&std_metadata, false).as_posix());
                     self.add_symlink(parent_inode, name, target, &host_meta)?
                 }
             };
@@ -522,13 +533,48 @@ mod tests {
         let base = std::env::temp_dir().join(format!("ext4kit-stream-{}", std::process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(base.join("nested"))?;
-        fs::write(base.join("nested").join("child.txt"), b"child")?;
+        let child_path = base.join("nested").join("child.txt");
+        fs::write(&child_path, b"child")?;
+        // Distinctive host metadata, so the assertions below fail if the
+        // import reads it from anywhere but the host file.
+        let mtime = 1_000_000_000;
+        fs::File::options()
+            .write(true)
+            .open(&child_path)?
+            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(mtime.into()))?;
+        let original_permissions = fs::metadata(&child_path)?.permissions();
+        let mut permissions = original_permissions.clone();
+        #[cfg(unix)]
+        let expected_mode = {
+            use std::os::unix::fs::PermissionsExt;
+            permissions.set_mode(0o640);
+            0o640
+        };
+        #[cfg(not(unix))]
+        let expected_mode = {
+            permissions.set_readonly(true);
+            0o444
+        };
+        fs::set_permissions(&child_path, permissions)?;
 
         let mut builder = Ext4ImageBuilder::new(16);
         builder.create_root_dir()?;
         builder.create_lost_and_found()?;
         builder.reserve_inodes();
-        let inode = builder.import_host_path_streaming(EXT4_ROOT_INO, &base)?;
+        let imported = builder.import_host_path_streaming(EXT4_ROOT_INO, &base);
+        fs::set_permissions(&child_path, original_permissions)?;
+        let inode = imported?;
+        let nested = builder
+            .lookup_dir_entry(inode, "nested")?
+            .expect("nested imported");
+        let child = builder
+            .lookup_dir_entry(nested, "child.txt")?
+            .expect("child.txt imported");
+        let mut payload = Vec::new();
+        builder.read_file(child, &mut payload)?;
+        assert_eq!(payload, b"child");
+        assert_eq!({ builder.inode(child).i_mtime }, mtime);
+        assert_eq!(builder.inode(child).i_mode & 0o7777, expected_mode);
         let (group, index) = builder.inode_location(inode);
         assert_eq!(
             builder.groups[group].inode_table[index].i_mode & 0xf000,

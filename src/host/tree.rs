@@ -33,6 +33,20 @@ pub(super) struct HostEntry {
     pub(super) parent_index: Option<usize>,
 }
 
+/// Returns the walker options for the host importers. They stat every entry
+/// themselves, because the walker's metadata lacks the fields ext4 needs on
+/// Windows (access/creation times, the read-only bit). On Windows and macOS
+/// directory enumeration supplies metadata for free, and asking for types
+/// only would switch to a slower enumeration; elsewhere the walker's metadata
+/// is an extra `lstat` per entry, so it is skipped.
+pub(super) fn walk_options() -> dua_core::Options {
+    if cfg!(any(windows, target_os = "macos")) {
+        dua_core::Options::default()
+    } else {
+        dua_core::Options::default().skip_metadata()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum HostFileType {
     Directory,
@@ -131,7 +145,7 @@ impl HostTree {
             source.as_ref(),
             threads,
             dua_core::Order::ParentFirst,
-            dua_core::Options::default(),
+            walk_options(),
             |_| true,
         );
 
