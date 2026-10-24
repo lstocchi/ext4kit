@@ -329,4 +329,56 @@ mod tests {
         assert!(builder.set_owner_recursive(9999, 1000, 1000).is_err());
         Ok(())
     }
+
+    #[test]
+    fn failed_oversized_xattr_preflight_changes_nothing() -> Result<()> {
+        let mut builder = fresh_builder()?;
+        let existing =
+            builder.add_file(EXT4_ROOT_INO, "existing", b"", &PosixMetadata::default())?;
+        let mut oversized = PosixMetadata::default();
+        oversized
+            .xattrs
+            .insert("user.big".into(), vec![0; BLOCK_SIZE]);
+
+        let counts = |builder: &Ext4ImageBuilder| {
+            (
+                builder.superblock.s_free_blocks_count_lo,
+                builder.superblock.s_free_inodes_count,
+                builder.group_descriptors[0].bg_free_blocks_count_lo,
+                builder.group_descriptors[0].bg_free_inodes_count_lo,
+                builder.group_descriptors[0].bg_used_dirs_count_lo,
+            )
+        };
+        let before = counts(&builder);
+        let check = |builder: &Ext4ImageBuilder, what: &str, result: Result<u32>| {
+            let error = result.expect_err(what);
+            assert!(
+                error.to_string().contains("exceed one filesystem block"),
+                "{what}: {error}"
+            );
+            assert_eq!(counts(builder), before, "{what}");
+        };
+        // A multi-block file and a slow symlink both have data blocks to leak.
+        let result = builder.add_file(EXT4_ROOT_INO, "f", &[1; BLOCK_SIZE * 3], &oversized);
+        check(&builder, "file", result);
+        let result = builder.add_symlink(EXT4_ROOT_INO, "l", &"t".repeat(80), &oversized);
+        check(&builder, "symlink", result);
+        let result = builder.add_fifo(EXT4_ROOT_INO, "p", &oversized);
+        check(&builder, "fifo", result);
+        let result = builder.mkdir(EXT4_ROOT_INO, "d", Some(&oversized));
+        check(&builder, "dir", result);
+        let result = builder
+            .set_inode_metadata(existing, &oversized)
+            .map(|()| existing);
+        check(&builder, "metadata", result);
+        for name in ["f", "l", "p", "d"] {
+            assert_eq!(
+                builder.lookup_dir_entry(EXT4_ROOT_INO, name)?,
+                None,
+                "{name}"
+            );
+        }
+        assert_eq!({ builder.inode(existing).i_file_acl_lo }, 0);
+        Ok(())
+    }
 }

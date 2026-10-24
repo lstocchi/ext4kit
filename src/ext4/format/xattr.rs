@@ -5,6 +5,12 @@ use anyhow::Result;
 use std::collections::HashMap;
 use zerocopy::IntoBytes;
 
+/// On-disk sizes of the external xattr block header, of one entry before
+/// its name, and of the zero end marker that follows the last entry.
+const XATTR_HEADER_LEN: usize = size_of::<Ext4XattrHeader>();
+const XATTR_ENTRY_LEN: usize = size_of::<Ext4XattrEntry>();
+const XATTR_END_MARKER_LEN: usize = 4;
+
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedXattr {
     pub(crate) index: u8,
@@ -22,17 +28,17 @@ pub(crate) fn encode_xattr_block(xattrs: &[PreparedXattr]) -> Result<Vec<u8>> {
         h_blocks: 1,
         ..Default::default()
     };
-    data[..32].copy_from_slice(header.as_bytes());
+    data[..XATTR_HEADER_LEN].copy_from_slice(header.as_bytes());
 
-    let (mut entry, mut value) = (32, BLOCK_SIZE);
+    let (mut entry, mut value) = (XATTR_HEADER_LEN, BLOCK_SIZE);
     let mut block_hash = 0u32;
     for xattr in xattrs {
         let aligned_value_len = align4(xattr.value.len());
         value = value
             .checked_sub(aligned_value_len)
             .ok_or(anyhow::anyhow!("xattrs exceed one filesystem block"))?;
-        let entry_len = 16 + align4(xattr.suffix.len());
-        if entry + entry_len + 4 > value {
+        let entry_len = XATTR_ENTRY_LEN + align4(xattr.suffix.len());
+        if entry + entry_len + XATTR_END_MARKER_LEN > value {
             return Err(anyhow::anyhow!("xattrs exceed one filesystem block"));
         }
         let entry_hash = xattr_entry_hash(xattr.suffix.as_bytes(), &xattr.value);
@@ -44,9 +50,10 @@ pub(crate) fn encode_xattr_block(xattrs: &[PreparedXattr]) -> Result<Vec<u8>> {
             e_value_size: xattr.value.len() as u32,
             e_hash: entry_hash,
         };
-        data[entry..entry + 16].copy_from_slice(xattr_entry.as_bytes());
+        data[entry..entry + XATTR_ENTRY_LEN].copy_from_slice(xattr_entry.as_bytes());
         block_hash = block_hash.rotate_left(16) ^ entry_hash;
-        data[entry + 16..entry + 16 + xattr.suffix.len()].copy_from_slice(xattr.suffix.as_bytes());
+        let name = entry + XATTR_ENTRY_LEN;
+        data[name..name + xattr.suffix.len()].copy_from_slice(xattr.suffix.as_bytes());
         // Values occupy an aligned extent on disk. Clear it explicitly so that
         // alignment padding remains deterministic if this buffer is ever reused.
         data[value..value + aligned_value_len].fill(0);
@@ -109,7 +116,26 @@ pub(crate) fn prepare_xattrs(xattrs: &HashMap<String, Vec<u8>>) -> Result<Vec<Pr
     prepared.sort_unstable_by(|left, right| {
         (left.index, &left.suffix).cmp(&(right.index, &right.suffix))
     });
+    // Checked here rather than only when encoding, so callers can reject an
+    // oversized set before they commit an inode or any blocks.
+    ensure_fits_one_block(&prepared)?;
     Ok(prepared)
+}
+
+/// Verifies that `xattrs` fit one external xattr block: the header and
+/// entries grow up from the start, the 4-byte end marker follows them, and
+/// the 4-byte-aligned values grow down from the end of the block.  This is
+/// the final, tightest check [`encode_xattr_block`] makes while it writes.
+fn ensure_fits_one_block(xattrs: &[PreparedXattr]) -> Result<()> {
+    let entries: usize = xattrs
+        .iter()
+        .map(|xattr| XATTR_ENTRY_LEN + align4(xattr.suffix.len()))
+        .sum();
+    let values: usize = xattrs.iter().map(|xattr| align4(xattr.value.len())).sum();
+    if XATTR_HEADER_LEN + entries + XATTR_END_MARKER_LEN + values > BLOCK_SIZE {
+        return Err(anyhow::anyhow!("xattrs exceed one filesystem block"));
+    }
+    Ok(())
 }
 
 /// Rounds a byte count up to an ext4 four-byte boundary; returns the aligned count.
@@ -176,5 +202,26 @@ mod tests {
             disk_acl,
             vec![1, 0, 0, 0, 1, 0, 7, 0, 4, 0, 5, 0, 32, 0, 5, 0]
         );
+    }
+
+    #[test]
+    fn prepare_rejects_sets_that_do_not_fit_one_block_like_the_encoder() {
+        // One "user.v" entry: 32-byte header, 20-byte entry (16 + "v"
+        // aligned to 4), 4-byte end marker, so 4040 value bytes fill the block.
+        let fill = BLOCK_SIZE - 32 - 20 - 4;
+        let set = |len: usize| HashMap::from([("user.v".to_owned(), vec![7u8; len])]);
+
+        let fits = prepare_xattrs(&set(fill)).unwrap();
+        assert!(encode_xattr_block(&fits).is_ok());
+
+        let error = prepare_xattrs(&set(fill + 1)).unwrap_err();
+        assert!(error.to_string().contains("exceed one filesystem block"));
+        // The encoder agrees, so the two checks cannot drift apart unnoticed.
+        let oversized = vec![PreparedXattr {
+            index: EXT4_XATTR_INDEX_USER,
+            suffix: "v".to_owned(),
+            value: vec![7; fill + 1],
+        }];
+        assert!(encode_xattr_block(&oversized).is_err());
     }
 }

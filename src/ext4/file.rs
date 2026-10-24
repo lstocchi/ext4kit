@@ -427,6 +427,29 @@ mod tests {
     }
 
     #[test]
+    fn oversized_xattrs_fail_before_the_payload_is_read() -> Result<()> {
+        // Rejecting the set in preflight, rather than when the xattr block is
+        // written, avoids streaming a payload that would only be rolled back.
+        struct Unread;
+        impl Read for Unread {
+            fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+                panic!("the payload must not be read");
+            }
+        }
+        let mut builder = fresh_builder()?;
+        let counts = free_counts(&builder);
+        let mut meta = PosixMetadata::default();
+        meta.xattrs.insert("user.big".into(), vec![0; BLOCK_SIZE]);
+        let size = 4 * BLOCK_SIZE as u64;
+        let error = builder
+            .add_file_from_reader(EXT4_ROOT_INO, "f", Unread, size, &meta)
+            .unwrap_err();
+        assert!(error.to_string().contains("exceed one filesystem block"));
+        assert_eq!(free_counts(&builder), counts);
+        Ok(())
+    }
+
+    #[test]
     fn reading_a_non_regular_file_fails() -> Result<()> {
         let builder = fresh_builder()?;
         assert!(builder.read_file(EXT4_ROOT_INO, &mut Vec::new()).is_err());
