@@ -6,7 +6,8 @@ The formatter currently creates valid ext4 images with a 4 KiB block size and
 256-byte inodes. It writes sparse-superblock layout (including backups and
 group descriptors), block and inode bitmaps, inode tables, the root directory,
 and `lost+found`. Every image carries a random filesystem UUID (`s_uuid`),
-as `mke2fs` writes one, alongside the random directory-hash seed.
+as `mke2fs` writes one, alongside the random directory-hash seed, and every
+image of at least 8 MiB a jbd2 journal.
 
 It supports regular files across fragmented block runs, building multi-level
 extent trees when needed. Directories have `.` and `..` entries, update parent
@@ -92,7 +93,11 @@ those made by `mke2fs`, are rejected. The image size is fixed. See
 - Image creation runs on Windows; Linux tools are only optional verification.
 - Layout is modeled on `e2fsprogs` and written directly using ext4 structures.
 - The implementation uses 32-bit block addresses and 32-byte group descriptors.
-- Images are deliberately created without a journal.
+- Every image of at least 8 MiB carries a jbd2 journal (v2 superblock,
+  big-endian, no checksum features; mke2fs-compatible sizes), so the guest
+  kernel recovers a crashed VM by replaying it on mount. Smaller images get
+  none, mirroring mke2fs. The snapshot reader never replays a journal; a
+  non-empty one is refused.
 - Sparse files, inline/shared xattrs, and SELinux validation are not
   implemented yet.
 - Host import preserves the portable subset of metadata supported by the host

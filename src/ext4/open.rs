@@ -435,57 +435,36 @@ mod tests {
             (|sb: &mut Ext4SuperBlock| sb.s_feature_incompat |= FLEX_BG) as fn(&mut _),
             |sb| sb.s_feature_ro_compat |= METADATA_CSUM,
             |sb| sb.s_feature_compat &= !EXT4_FEATURE_COMPAT_DIR_INDEX,
-            // needs_recovery without a journal is meaningless; only the
-            // kernel writes it, and only together with has_journal.
-            |sb| sb.s_feature_incompat |= EXT4_FEATURE_INCOMPAT_RECOVER,
         ] {
             let (_, mut bytes) = written_image();
             with_superblock(&mut bytes, change);
             assert!(load_error(bytes).contains("unsupported ext4 features"));
         }
-    }
-
-    /// Turns inode 8 into an extent-mapped inode whose first block holds a
-    /// valid empty jbd2 superblock, so a superblock with `has_journal` set
-    /// and `_s_journal_inum` 8 points at a parsable, empty journal.
-    fn add_empty_journal(builder: &Ext4ImageBuilder, bytes: &mut [u8]) {
-        let table = builder.group_descriptors[0].bg_inode_table_lo as usize;
-        let inode_offset = table * BLOCK_SIZE + 7 * INODE_SIZE;
-        let mut inode =
-            Ext4Inode::read_from_bytes(&bytes[inode_offset..inode_offset + INODE_SIZE]).unwrap();
-        inode.i_flags |= EXT4_EXTENTS_FL;
-        inode.i_blocks_lo = 8; // 4 KiB data block = 8 sectors
-        let jsb_block = builder.superblock.s_blocks_count_lo - 1;
-        let header = Ext4ExtentHeader {
-            eh_magic: EXT4_EH_MAGIC,
-            eh_entries: 1,
-            eh_max: EXT4_EXTENTS_IN_INODE as u16,
-            eh_depth: 0,
-            eh_generation: 0,
-        };
-        inode.i_block[..12].copy_from_slice(header.as_bytes());
-        let extent = Ext4Extent {
-            ee_block: 0,
-            ee_len: 1,
-            ee_start_hi: 0,
-            ee_start_lo: jsb_block,
-        };
-        inode.i_block[12..24].copy_from_slice(extent.as_bytes());
-        bytes[inode_offset..inode_offset + INODE_SIZE].copy_from_slice(inode.as_bytes());
-        // The jsb: big-endian magic and v2 blocktype, s_start 0 at 0x1C.
-        let jsb_offset = jsb_block as usize * BLOCK_SIZE;
-        let jsb = &mut bytes[jsb_offset..jsb_offset + BLOCK_SIZE];
-        jsb.fill(0);
-        jsb[..4].copy_from_slice(&crate::ext4::reader::JBD2_MAGIC.to_be_bytes());
-        jsb[4..8].copy_from_slice(&crate::ext4::reader::JBD2_SUPERBLOCK_V2.to_be_bytes());
-        jsb[0x0C..0x10].copy_from_slice(&(BLOCK_SIZE as u32).to_be_bytes());
+        // needs_recovery on a journal-less image is meaningless; only the
+        // kernel writes it, and only together with has_journal.
+        let mut builder = Ext4ImageBuilder::new_without_journal(16);
+        builder.create_root_dir().unwrap();
+        builder.create_lost_and_found().unwrap();
+        builder.reserve_inodes();
+        builder.commit_metadata();
+        let mut bytes = builder.disk_data.to_vec();
+        with_superblock(&mut bytes, |superblock| {
+            superblock.s_feature_incompat |= EXT4_FEATURE_INCOMPAT_RECOVER;
+        });
+        let error = load_error(bytes);
+        assert!(
+            error.contains("unsupported ext4 features"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
     fn rejects_a_journal_feature_without_a_journal_inode() {
+        // The fixture carries a real journal, so the meaningful corruption
+        // is clearing the journal inode number while keeping has_journal.
         let (_, mut bytes) = written_image();
         with_superblock(&mut bytes, |superblock| {
-            superblock.s_feature_compat |= EXT4_FEATURE_COMPAT_HAS_JOURNAL;
+            superblock._s_journal_inum = 0;
         });
         let error = load_error(bytes);
         assert!(
@@ -496,11 +475,10 @@ mod tests {
 
     #[test]
     fn rejects_a_mounted_journaled_image_with_the_mounted_message() {
-        let (builder, mut bytes) = written_image();
-        add_empty_journal(&builder, &mut bytes);
+        // The fixture's journal is real and empty; needs_recovery on top of
+        // it is the mounted marker.
+        let (_, mut bytes) = written_image();
         with_superblock(&mut bytes, |superblock| {
-            superblock.s_feature_compat |= EXT4_FEATURE_COMPAT_HAS_JOURNAL;
-            superblock._s_journal_inum = 8;
             superblock.s_feature_incompat |= EXT4_FEATURE_INCOMPAT_RECOVER;
         });
         let error = load_error(bytes);
@@ -512,15 +490,16 @@ mod tests {
 
     #[test]
     fn rejects_a_non_empty_journal() {
+        // Corrupt the fixture's real journal superblock: s_start at jsb
+        // byte 0x1C, big-endian, one unprocessed transaction.
         let (builder, mut bytes) = written_image();
-        add_empty_journal(&builder, &mut bytes);
+        let journal_inode = builder.inode(8);
+        let extents = builder.get_inode_extents(journal_inode).unwrap();
+        let jsb_block = extents[0].ee_start_lo;
         with_superblock(&mut bytes, |superblock| {
-            superblock.s_feature_compat |= EXT4_FEATURE_COMPAT_HAS_JOURNAL;
             superblock._s_journal_inum = 8;
         });
-        // s_start at jsb byte 0x1C, big-endian: an unprocessed transaction.
-        let jsb_block = builder.superblock.s_blocks_count_lo as usize - 1;
-        bytes[jsb_block * BLOCK_SIZE + 0x1C..jsb_block * BLOCK_SIZE + 0x20]
+        bytes[jsb_block as usize * BLOCK_SIZE + 0x1C..jsb_block as usize * BLOCK_SIZE + 0x20]
             .copy_from_slice(&1u32.to_be_bytes());
         let error = load_error(bytes);
         assert!(

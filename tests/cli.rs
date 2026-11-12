@@ -166,6 +166,54 @@ fn created_images_carry_a_random_filesystem_uuid() {
         Some(&b'4'),
         "a version-4 UUID like mke2fs writes: {uuid}"
     );
+    // The journal: inode 8, the mke2fs size for the image, an empty log.
+    // debugfs pads the columns, so match whole trimmed lines.
+    let stats_field = |name: &str| -> String {
+        stats
+            .lines()
+            .find_map(|line| line.trim_start().strip_prefix(name))
+            .map(|rest| rest.trim().to_owned())
+            .unwrap_or_else(|| panic!("debugfs stats must report {name}: {stats}"))
+    };
+    assert_eq!(stats_field("Journal inode:"), "8");
+    let journal = image.debugfs("stat <8>");
+    assert!(
+        journal.contains("Size: 4194304"),
+        "a 16 MiB image carries the 4 MiB journal: {journal}"
+    );
+    // An empty log: debugfs stats does not report Journal start for a
+    // journal it never loaded, but dumpe2fs -h does.
+    if let Some(tools) = e2fsprogs_tools() {
+        let output = common::run_tool(tools, "dumpe2fs", &["-h", &tools.target(&out)]);
+        let dump = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            dump.lines()
+                .any(|line| line.split_whitespace().collect::<Vec<_>>().join(" ")
+                    == "Journal start: 0"),
+            "a freshly created journal must be empty: {dump}"
+        );
+
+        // A writable e2fsck has nothing to change. `-n` skips the
+        // s_jnl_blocks backup check entirely, so only a `-y` run on a copy
+        // catches a backup that doesn't match inode 8's extent root.
+        let copy = out.with_extension("fsck.img");
+        std::fs::copy(&out, &copy).unwrap();
+        let output = common::run_tool(tools, "e2fsck", &["-fy", &tools.target(&copy)]);
+        let report = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.status.success() && !report.contains("MODIFIED"),
+            "a writable e2fsck must leave a fresh image untouched ({}):\n{report}",
+            output.status
+        );
+    }
 }
 
 /// The jsb decoder must agree with `dumpe2fs` on an image `mke2fs` made: a
@@ -327,6 +375,64 @@ fn reader_matches_the_journal_state_machine_of_a_mounted_filesystem() {
     expect(&base.join("frozen.img"), false, true);
     // Clean unmount: same on-disk state as frozen.
     expect(&base.join("unmounted.img"), false, true);
+}
+
+/// The kernel must accept an ext4kit-written journal: mount the image the
+/// binary just created, write a file, sync, and cleanly unmount. After the
+/// unmount the image reopens (a clean unmount leaves an empty journal and
+/// VALID_FS set), the written file is visible, and e2fsck stays clean.
+///
+/// Needs root for the loop mount: WSL `wsl -u root` or native passwordless
+/// `sudo -n`; other environments skip with a note.
+#[test]
+fn the_kernel_mounts_a_created_image_and_replays_its_journal() {
+    use ext4kit::ext4::reader::ImageReader;
+
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("src");
+    fs::create_dir(&dir).unwrap();
+    fs::write(dir.join("a.txt"), "hi\n").unwrap();
+    let out = tmp.path().join("out.img");
+    create(&["--add", &format!("{}:/opt", arg(&dir))], &out);
+
+    let Some(tools) = e2fsprogs_tools() else {
+        return;
+    };
+    let target = tools.target(&out);
+    let script = format!(
+        "set -e\n\
+         umount /mnt/ext4kit-mount 2>/dev/null || true\n\
+         mkdir -p /mnt/ext4kit-mount\n\
+         mount -o loop \"{target}\" /mnt/ext4kit-mount\n\
+         echo kernel-accepted > /mnt/ext4kit-mount/proof.txt\n\
+         sync\n\
+         umount /mnt/ext4kit-mount"
+    );
+    let Some(output) = common::root_shell(tools, &script) else {
+        return;
+    };
+    assert!(
+        output.status.success(),
+        "the kernel did not mount the image (its journal was rejected?): {}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // A clean unmount: the image reopens, the journal is empty, the
+    // kernel-written file is there, and e2fsck has nothing to say.
+    let (reader, state) = ImageReader::open(&out).unwrap();
+    assert!(state.has_journal);
+    assert!(state.journal_empty, "clean unmount empties the journal");
+    assert!(!state.mounted);
+    let _ = reader;
+    let Some(image) = Image::check(&out) else {
+        return;
+    };
+    assert_eq!(
+        image.cat("/proof.txt"),
+        "kernel-accepted\n",
+        "the file written by the kernel must be readable back"
+    );
 }
 
 #[test]

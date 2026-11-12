@@ -28,6 +28,11 @@ pub const EXT4_INDEXES_PER_BLOCK: usize =
 pub const EXT4_BAD_INO: u32 = 1;
 pub const EXT4_ROOT_INO: u32 = 2;
 pub const EXT4_FIRST_INO: u32 = 11;
+/// The jbd2 journal inode mke2fs places its journal in.
+pub const EXT4_JOURNAL_INO: u32 = 8;
+/// `s_jnl_backup_type` value: `s_jnl_blocks` holds the journal's first
+/// block numbers (e2fsprogs EXT3_JNL_BACKUP_BLOCKS).
+pub const EXT3_JNL_BACKUP_BLOCKS: u8 = 1;
 
 // File Types
 pub const EXT4_FT_UNKNOWN: u8 = 0;
@@ -94,6 +99,11 @@ pub const EXT2_ERROR_FS: u16 = 0x0002;
 /// part of [`Ext4SuperBlock`] that is kept as opaque padding.
 pub const EXT4_SUPERBLOCK_FLAGS_OFFSET: usize = 0x160;
 pub const EXT2_FLAGS_UNSIGNED_HASH: u32 = 0x0002;
+/// What mke2fs writes: dirhash input bytes are sign-extended, matching
+/// this crate's `ext4_dirhash_half_md4`. Without it, the kernel records
+/// its own (unsigned) choice in `s_flags` on the first mount, and the
+/// strict open then rejects the image as using unsigned hashes.
+pub const EXT2_FLAGS_SIGNED_HASH: u32 = 0x0001;
 
 #[repr(C, packed)]
 #[derive(Clone, Copy, Debug, FromBytes, Immutable, IntoBytes, KnownLayout)]
@@ -147,7 +157,22 @@ pub struct Ext4SuperBlock {
     pub s_def_hash_version: u8,
     pub _s_jnl_backup_type: u8,
     pub _s_desc_size: u16,
-    pub _padding: [u8; 768],
+    pub s_default_mount_opts: u32,
+    pub s_first_meta_bg: u32,
+    pub s_mkfs_time: u32,
+    /// Backup of the journal inode's first block numbers, valid when
+    /// `s_jnl_backup_type` is set (kernel `s_jnl_blocks[17]`, offset 0x10C).
+    pub s_jnl_blocks: [u32; 17],
+    /// 64-bit block counts; this writer uses 32-bit numbers, so these stay 0.
+    pub s_blocks_count_hi: u32,
+    pub s_r_blocks_count_hi: u32,
+    pub s_free_blocks_count_hi: u32,
+    pub s_min_extra_isize: u16,
+    pub s_want_extra_isize: u16,
+    /// Miscellaneous flags. SIGNED_HASH records that dirhash input bytes
+    /// are sign-extended, which both this crate and the kernel honor.
+    pub s_flags: u32,
+    pub _padding: [u8; 668],
 }
 
 impl Default for Ext4SuperBlock {
@@ -206,7 +231,20 @@ impl Default for Ext4SuperBlock {
             s_def_hash_version: dirhash::DX_HASH_HALF_MD4,
             _s_jnl_backup_type: 0,
             _s_desc_size: 0,
-            _padding: [0; 768],
+            s_default_mount_opts: 0,
+            s_first_meta_bg: 0,
+            s_mkfs_time: 0,
+            s_jnl_blocks: [0; 17],
+            s_blocks_count_hi: 0,
+            s_r_blocks_count_hi: 0,
+            s_free_blocks_count_hi: 0,
+            s_min_extra_isize: 0,
+            s_want_extra_isize: 0,
+            // Like mke2fs: dirhash bytes are sign-extended (see
+            // format::dirhash). Without this the kernel records its own
+            // unsigned choice on first mount.
+            s_flags: EXT2_FLAGS_SIGNED_HASH,
+            _padding: [0; 668],
         }
     }
 }
