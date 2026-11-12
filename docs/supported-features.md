@@ -33,6 +33,36 @@ The demonstration image contains:
 
 `hello.txt` contains `Created by ext4kit` and has `user.creator=ext4kit`.
 
+## Tracked folders
+
+`create` records folder tracking when every `--add` source is inside a git
+repository and no two additions overlap (image targets or repo-relative host
+paths): a sidecar `<image>.ext4kit-tracked` ties the image's UUID to a label
+and its mappings, and one baseline commit per repository lands on
+`refs/ext4kit/<label>/base`, parented on HEAD. The baseline holds exactly the
+imported content — normalized with git's clean-conversion rules (eol
+attributes, `core.autocrlf`, `filter=`/`ident` routes through
+`git hash-object`) and filtered with the repository's ignore rules, which a
+per-label `--include-ignored` at create turns off. Nested repositories and
+submodule pointers are boundaries like they are for git itself: a gitlink is
+re-emitted unchanged, a nested clone's files never enter the outer commit. A
+mapping root the walk cannot resolve or list (replaced by a symlink,
+unlistable) skips the mapping — content the walk could not see is never
+deleted from the baseline. HEAD paths whose names cannot exist on the host
+(a control byte, a reserved Windows device name) are kept from HEAD with
+their raw bytes instead of being deleted, and names the walk classifies as
+host-incompatible are reported, never auto-renamed.
+The `ext4kit snapshot` command that turns image state into commits on
+`refs/ext4kit/<label>/head` follows in the next release.
+
+Re-creating over a tracked image keeps the previous baseline refs under
+`refs/ext4kit/<label>/previous/<timestamp>/` and refuses to discard
+unsnapshotted work (or a still-mounted image) without the explicit
+`--discard-unsnapshotted` / `--replace-mounted` overrides. A sidecar whose
+recorded image UUID does not match the image is foreign: it is reported and
+removed, its refs are never moved, and a label it happens to use still
+collides.
+
 ## Metadata API
 
 Creation methods accept `PosixMetadata`:

@@ -52,6 +52,8 @@ The library is layered; a module uses only the layers above it:
 3. `vfs`: name-based access, turning paths into inodes through directories
    and symlinks, and the coreutils-style edits.
 4. `host`, `oci`: importers of external content, built on `vfs` and `ext4`.
+5. `tracked`: turning image state into git commits, reading the image only
+   through `ext4::reader::ImageReader` and driving git through `host::git`.
 
 `main.rs` only parses arguments and orchestrates these.
 
@@ -71,6 +73,8 @@ The library is layered; a module uses only the layers above it:
 | `src/vfs/resolve.rs` | Path resolution through symlinks, confined to the image root (`resolve_entry`, `resolve_directory`, `resolve_path`), and `ensure_directory` |
 | `src/vfs/edit.rs` | Path-level edits with coreutils semantics (`remove_path`, `make_directory`, `chmod_path`, `chown_path`, `write_path`, `test_path`, ...) behind `ext4kit edit` |
 | `src/host/` | Host directory import (`dua-core` walk) and sizing; `tree.rs` is the pre-scanned `HostTree` arena |
+| `src/host/git.rs` | The git machinery folder tracking drives: repo discovery and command hygiene, the persistent check-ignore session, check-attr/cat-file/hash-object routes, the `ExactLen` framing writer, the eol normalizer and the fast-import writer |
+| `src/tracked/` | The tracked-folder layer, reading images only through `ext4::reader::ImageReader`: the sidecar (`sidecar.rs`), name classification (`names.rs`), the image walk (`scan.rs`), and `commit.rs`, which turns a scan into the base (and later head) commits |
 | `src/oci/` | Tar layer application with whiteouts (`mod.rs`), registry pulls (`remote.rs`), Docker/Podman engines (`local.rs`) |
 | `src/main.rs` | Thin clap CLI: argument parsing, sizing and orchestration only. Filesystem logic belongs in the library |
 
@@ -123,7 +127,10 @@ streaming import design.
   checks are skipped with a note; CI sets `EXT4KIT_REQUIRE_E2FSPROGS=1` so
   they fail instead. `oci.rs` holds `#[ignore]`d `--from` tests that need
   Docker Hub or a Docker engine. `open.rs` reopens created images through
-  the library, and `edit.rs` runs sequences of `ext4kit edit` calls.
+  the library, `edit.rs` runs sequences of `ext4kit edit` calls, and
+  `tracked.rs` covers folder tracking at create time, skipping with a note
+  when git is missing (`EXT4KIT_REQUIRE_GIT=1` makes it fail instead, like
+  the e2fsprogs pattern).
 - Build small images in memory with `Ext4ImageBuilder::new(16)`, then call
   `create_root_dir()`, `create_lost_and_found()` and `reserve_inodes()`
   (`ext4::test_support::fresh_builder()` does this). Assert by reading back

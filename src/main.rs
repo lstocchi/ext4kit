@@ -8,6 +8,9 @@ use ext4kit::{
         local::{Engine, LocalImage},
         remote::RemoteImage,
     },
+    tracked::create::{
+        TrackedSource, TrackingFlags, finish_tracking, prepare_tracking, retire_old_tracking,
+    },
     vfs::edit::{EntryAttributes, PathTest},
 };
 use std::{
@@ -65,6 +68,31 @@ enum Command {
         /// Example: --root-owner 1000:1000
         #[arg(long, value_name = "UID[:GID]", value_parser = parse_owner)]
         root_owner: Option<(u32, u32)>,
+
+        /// Label of the tracked-folder refs (default: the image file
+        /// name). Pass one when several images share a basename.
+        #[arg(long, value_name = "LABEL")]
+        label: Option<String>,
+
+        /// Include gitignored paths in the tracked baseline and in every
+        /// snapshot of this image. Fixed per label at create.
+        #[arg(long)]
+        include_ignored: bool,
+
+        /// Re-create over an old tracked image that is mounted or was not
+        /// cleanly unmounted. Only for a VM that crashed, was killed, or
+        /// will never resume.
+        #[arg(long)]
+        replace_mounted: bool,
+
+        /// Discard agent changes in the old tracked image that were never
+        /// snapshotted, instead of refusing to re-create over it.
+        #[arg(long)]
+        discard_unsnapshotted: bool,
+
+        /// Print tracking phase timings.
+        #[arg(long)]
+        verbose: bool,
     },
 
     /// Change an image created by ext4kit in place, one operation per call.
@@ -225,7 +253,27 @@ fn main() -> ExitCode {
             size,
             chown,
             root_owner,
-        } => run_create(add, from, output, size, chown, root_owner).map(|()| ExitCode::SUCCESS),
+            label,
+            include_ignored,
+            replace_mounted,
+            discard_unsnapshotted,
+            verbose,
+        } => run_create(
+            add,
+            from,
+            output,
+            size,
+            chown,
+            root_owner,
+            TrackingFlags {
+                label,
+                include_ignored,
+                replace_mounted,
+                discard_unsnapshotted,
+                verbose,
+            },
+        )
+        .map(|()| ExitCode::SUCCESS),
         Command::Edit { image, action } => run_edit(&image, action),
     };
     result.unwrap_or_else(|error| {
@@ -241,6 +289,7 @@ fn run_create(
     size: Option<usize>,
     chown: Option<(u32, u32)>,
     root_owner: Option<(u32, u32)>,
+    tracking_flags: TrackingFlags,
 ) -> anyhow::Result<()> {
     let additions: Vec<Addition> = add
         .iter()
@@ -251,6 +300,21 @@ fn run_create(
     if size.is_some_and(|size| size < 16) {
         anyhow::bail!("--size must be at least 16 MiB");
     }
+    // The tracking checks (overlap, discovery, dirty, label) all run
+    // before Ext4ImageBuilder::new_file truncates the output, so a
+    // refusal leaves the old image, sidecar and refs exactly as they
+    // were.
+    let sources: Vec<TrackedSource> = additions
+        .iter()
+        .map(|addition| {
+            Ok(TrackedSource {
+                source: addition.source.clone(),
+                target: addition.target(),
+                is_dir: addition.is_directory()?,
+            })
+        })
+        .collect::<anyhow::Result<_>>()?;
+    let (tracking, old_tracking) = prepare_tracking(&sources, &output, &tracking_flags)?;
     // The runtime only drives engine and registry I/O; image import itself
     // runs on this thread and blocks on it.
     let base = match from.as_deref() {
@@ -265,6 +329,13 @@ fn run_create(
         .as_ref()
         .map(|(_, source)| source.size_mib())
         .transpose()?;
+    // Retiring the old tracking state runs after the network work — a
+    // registry failure must leave the old image tracked, refs and sidecar
+    // untouched — but before the host scan: the scan snapshots the tree
+    // the import later reads from, and retiring between them would delete
+    // refs the import still expects. Everything after this point until
+    // `new_file` is local.
+    retire_old_tracking(&output, old_tracking.as_ref())?;
     let (image_size_mb, host_trees) = match size {
         Some(size) => {
             if let Some(estimate) = base_size.filter(|&estimate| estimate > size) {
@@ -330,6 +401,15 @@ fn run_create(
     })?)?;
 
     println!("Ext4 image successfully generated at: {}", output.display());
+    if let Some(prepared) = tracking {
+        finish_tracking(
+            &output,
+            builder.superblock.s_uuid,
+            &prepared,
+            image_size_mb,
+            &tracking_flags,
+        );
+    }
     Ok(())
 }
 
