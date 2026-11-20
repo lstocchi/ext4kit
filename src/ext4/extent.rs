@@ -20,11 +20,15 @@ pub(crate) struct ExtentTree {
     pub(crate) tree_blocks: Vec<u32>,
 }
 
-/// Builds initialized leaf extents from physical runs, assigning consecutive logical blocks.
+/// Builds initialized leaf extents from physical runs, assigning consecutive
+/// logical blocks. Run lengths from `plan_data_blocks` are capped at 32,768
+/// blocks (the initialized-extent limit), which is asserted here: a longer
+/// run would truncate `ee_len` silently.
 pub(super) fn extents_for_runs(runs: &[(u32, u32)]) -> Vec<Ext4Extent> {
     let mut logical = 0u32;
     runs.iter()
         .map(|&(start, len)| {
+            debug_assert!(len <= u32::from(EXT_INIT_MAX_LEN));
             let extent = Ext4Extent {
                 ee_block: logical,
                 ee_len: len as u16,

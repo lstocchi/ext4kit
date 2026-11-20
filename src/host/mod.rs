@@ -118,9 +118,13 @@ impl Ext4ImageBuilder {
             // One block bitmap and one inode bitmap per group, plus primary
             // and sparse-super backup metadata. This is conservative.
             let ext4_metadata_blocks = inode_table_blocks + groups * 4;
+            // Every image of at least 8 MiB carries a journal (4 MiB under
+            // 128 MiB, a growing ladder above), which is not free space.
+            let journal_blocks = u64::from(Self::journal_blocks_for_size(size_mib).unwrap_or(0));
             let allocated_blocks = usage
                 .data_blocks
                 .checked_add(ext4_metadata_blocks as u64)
+                .and_then(|blocks| blocks.checked_add(journal_blocks))
                 .ok_or_else(|| anyhow::anyhow!("allocation estimate overflow"))?;
             let required_with_free_space = allocated_blocks
                 .checked_mul(110)

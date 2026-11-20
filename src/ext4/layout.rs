@@ -380,13 +380,17 @@ impl Ext4ImageBuilder {
         Ok(())
     }
 
-    /// Reserves ext4's fixed low-numbered inodes; returns no value.
+    /// Reserves ext4's fixed low-numbered inodes; returns no value. Inodes
+    /// already allocated — the journal's inode 8 on images that carry one —
+    /// are skipped, so the free-inode accounting never double-counts.
     pub fn reserve_inodes(&mut self) {
         self.mark_inode_used(EXT4_BAD_INO);
 
         // Skip Root (#2) and lost+found (#11), mark remaining 3..=10
         for inode_num in (EXT4_ROOT_INO + 1)..EXT4_FIRST_INO {
-            self.mark_inode_used(inode_num);
+            if !self.is_inode_allocated(inode_num) {
+                self.mark_inode_used(inode_num);
+            }
         }
     }
 

@@ -176,9 +176,22 @@ impl E2fsprogs {
 /// Runs `command`, retrying WSL transport failures. Under parallel test load
 /// the WSL service intermittently fails a client outright with exit code -1
 /// (`Wsl/Service/E_UNEXPECTED`, `0x8007274c` timeouts); the e2fsprogs tools
-/// never exit -1, so the signature is unambiguous. Native runs pass `false`
-/// and never retry.
+/// never exit -1, so the signature is unambiguous. WSL invocations also
+/// hold a global lock, because the service degrades badly when several
+/// test threads hammer it at once — retries alone cannot save an
+/// every-attempt-fails storm. Native runs pass `false`, never retry and
+/// never lock.
 fn output_with_retry(command: &mut Command, retry_wsl_failures: bool) -> std::process::Output {
+    // The lock is per test binary (each integration-test crate gets its own
+    // copy), which is enough: within one binary the parallel test threads
+    // are what overwhelm the service.
+    static WSL_LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+    let _guard = retry_wsl_failures.then(|| {
+        WSL_LOCK
+            .get_or_init(Default::default)
+            .lock()
+            .expect("another thread panicked while holding the WSL lock")
+    });
     try_output_with_retry(command, retry_wsl_failures).expect("failed to run e2fsprogs")
 }
 

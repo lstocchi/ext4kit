@@ -20,6 +20,7 @@ mod file;
 pub mod format;
 mod htree;
 mod inode;
+mod journal;
 mod layout;
 use layout::PlannedGeometry;
 mod open;
@@ -84,6 +85,8 @@ impl Ext4ImageBuilder {
     /// blocks is dropped, so the
     /// filesystem can be slightly smaller than the requested image; a size
     /// too small for a single block group panics with a clear message.
+    /// Every image of at least 8 MiB carries a jbd2 journal, as `mke2fs`
+    /// writes one; smaller images get none, mirroring `mke2fs`.
     pub fn new(size_mb: usize) -> Self {
         let image_size_bytes = size_mb * 1024 * 1024;
         let geometry = Self::plan_geometry(image_size_bytes / BLOCK_SIZE).unwrap_or_else(|err| {
@@ -92,10 +95,39 @@ impl Ext4ImageBuilder {
         Self::new_with_storage(geometry, DiskData::Memory(vec![0; image_size_bytes]))
     }
 
+    /// Creates an in-memory builder without a journal, for tests and for
+    /// callers that manage their own recovery; see
+    /// [`Ext4ImageBuilder::new`].
+    pub fn new_without_journal(size_mb: usize) -> Self {
+        let image_size_bytes = size_mb * 1024 * 1024;
+        let geometry = Self::plan_geometry(image_size_bytes / BLOCK_SIZE).unwrap_or_else(|err| {
+            panic!("cannot lay out an image of {image_size_bytes} bytes: {err}")
+        });
+        Self::new_with_storage_impl(geometry, DiskData::Memory(vec![0; image_size_bytes]), false)
+    }
+
     /// Creates an image directly in `output_path`. The mapping is file-backed,
     /// so imported payload pages can be flushed instead of retaining a second
-    /// complete image-sized heap allocation.
+    /// complete image-sized heap allocation. Every image of at least 8 MiB
+    /// carries a jbd2 journal.
     pub fn new_file(size_mb: usize, output_path: impl AsRef<Path>) -> std::io::Result<Self> {
+        Self::new_file_with_journal(size_mb, output_path, true)
+    }
+
+    /// Creates a file-backed image without a journal; see
+    /// [`Ext4ImageBuilder::new_file`].
+    pub fn new_file_without_journal(
+        size_mb: usize,
+        output_path: impl AsRef<Path>,
+    ) -> std::io::Result<Self> {
+        Self::new_file_with_journal(size_mb, output_path, false)
+    }
+
+    fn new_file_with_journal(
+        size_mb: usize,
+        output_path: impl AsRef<Path>,
+        journal: bool,
+    ) -> std::io::Result<Self> {
         let image_size_bytes = size_mb
             .checked_mul(1024 * 1024)
             .ok_or_else(|| std::io::Error::other("image size overflow"))?;
@@ -113,13 +145,22 @@ impl Ext4ImageBuilder {
         // the file remains at its fixed length for the lifetime of the
         // mapping, and all access is mediated through the uniquely owned MmapMut.
         let mapping = unsafe { MmapOptions::new().map_mut(&file)? };
-        Ok(Self::new_with_storage(
+        Ok(Self::new_with_storage_impl(
             geometry,
             DiskData::File { mapping, path },
+            journal,
         ))
     }
 
     fn new_with_storage(geometry: PlannedGeometry, disk_data: DiskData) -> Self {
+        Self::new_with_storage_impl(geometry, disk_data, true)
+    }
+
+    fn new_with_storage_impl(
+        geometry: PlannedGeometry,
+        disk_data: DiskData,
+        journal: bool,
+    ) -> Self {
         if BYTES_PER_INODE_RATIO < BLOCK_SIZE {
             panic!("BYTES_PER_INODE_RATIO must be greater than or equal to BLOCK_SIZE");
         }
@@ -214,6 +255,11 @@ impl Ext4ImageBuilder {
         };
 
         builder.init_layout();
+        if journal {
+            builder
+                .create_journal()
+                .expect("a fresh image always has room for its journal");
+        }
         builder
     }
 }

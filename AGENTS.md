@@ -100,7 +100,8 @@ streaming import design.
   its extents.
 - **Fixed format choices**, modeled on e2fsprogs: 4 KiB blocks, 256-byte
   inodes, 32-bit block numbers, 32-byte group descriptors, sparse superblocks,
-  extents, **no journal**. Changing any of these is a design decision, so ask
+  extents, **a jbd2 journal** (v2 superblock, big-endian, no checksum
+  features; mke2fs-compatible sizes). Changing any of these is a design decision, so ask
   before doing it.
 - **Cross-platform.** Windows is the primary target but the code also compiles
   on Unix (`#[cfg(unix)]` / `#[cfg(windows)]` in `host/tree.rs`,
