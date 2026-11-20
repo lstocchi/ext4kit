@@ -108,7 +108,7 @@ fn fixture(files: &[(&str, &str)]) -> Fixture {
 
 /// Runs `ext4kit create EXTRA... --add REPO:/opt IMAGE`.
 fn create_tracked(repo: &Path, extra: &[&str], image: &Path) -> Output {
-    let mut args: Vec<String> = vec!["create".to_owned()];
+    let mut args: Vec<String> = vec!["create".to_owned(), "--track".to_owned()];
     args.extend(extra.iter().map(|flag| (*flag).to_owned()));
     args.push("--add".to_owned());
     args.push(format!("{}:/opt", arg(repo)));
@@ -215,11 +215,17 @@ fn file_additions_are_tracked_as_single_files() {
     // The destination is the parent directory, like every --add: the
     // file's basename lands inside it.
     let notes = format!("{}:/etc", arg(&fixture.repo.join("docs/notes.txt")));
-    ext4kit(&["create", "--add", notes.as_str(), arg(&image).as_str()])
-        .status
-        .success()
-        .then_some(())
-        .expect("create succeeds");
+    ext4kit(&[
+        "create",
+        "--track",
+        "--add",
+        notes.as_str(),
+        arg(&image).as_str(),
+    ])
+    .status
+    .success()
+    .then_some(())
+    .expect("create succeeds");
     let record = sidecar(&image);
     assert_eq!(record["mappings"][0]["kind"], "file");
     assert_eq!(record["mappings"][0]["image"], "/etc/notes.txt");
@@ -275,6 +281,7 @@ fn overlapping_targets_disable_tracking_but_not_the_create() {
     let second = format!("{}:/opt/app", arg(&elsewhere));
     let output = ext4kit(&[
         "create",
+        "--track",
         "--add",
         first.as_str(),
         "--add",
@@ -300,6 +307,7 @@ fn create_tracked_against(repo: &Path, other: &Path, image: &Path) -> Output {
     let second = format!("{}:/srv", arg(other));
     ext4kit(&[
         "create",
+        "--track",
         "--add",
         first.as_str(),
         "--add",
@@ -319,7 +327,13 @@ fn mappings_outside_repositories_are_reported_not_tracked() {
     fs::write(untracked.join("x.txt"), "x\n").unwrap();
     let image = fixture.image("out.img");
     let add = format!("{}:/opt", arg(&untracked));
-    let output = ext4kit(&["create", "--add", add.as_str(), arg(&image).as_str()]);
+    let output = ext4kit(&[
+        "create",
+        "--track",
+        "--add",
+        add.as_str(),
+        arg(&image).as_str(),
+    ]);
     assert!(output.status.success(), "{output:?}");
     assert!(
         String::from_utf8_lossy(&output.stderr).contains("not inside a git repository"),
@@ -643,11 +657,17 @@ fn images_without_tracked_content_get_no_sidecar() {
     fs::create_dir_all(&plain).unwrap();
     fs::write(plain.join("x.txt"), "x\n").unwrap();
     let add = format!("{}:/opt", arg(&plain));
-    ext4kit(&["create", "--add", add.as_str(), arg(&image).as_str()])
-        .status
-        .success()
-        .then_some(())
-        .expect("create succeeds");
+    ext4kit(&[
+        "create",
+        "--track",
+        "--add",
+        add.as_str(),
+        arg(&image).as_str(),
+    ])
+    .status
+    .success()
+    .then_some(())
+    .expect("create succeeds");
     assert!(!sidecar_exists(&image));
 }
 
@@ -674,6 +694,7 @@ fn a_foreign_ref_with_the_same_label_survives_a_re_create() {
     let second_add = format!("{}:/other", arg(&b.repo));
     let output = ext4kit(&[
         "create",
+        "--track",
         "--label",
         "shared",
         "--discard-unsnapshotted",
@@ -736,6 +757,7 @@ fn a_missing_git_still_gates_the_old_image() {
     let add = format!("{}:/opt", arg(&fixture.repo));
     let args: Vec<String> = vec![
         "create".to_owned(),
+        "--track".to_owned(),
         "--discard-unsnapshotted".to_owned(),
         "--add".to_owned(),
         add,
@@ -767,6 +789,7 @@ fn retiring_without_git_leaves_the_refs_in_place() {
     let add = format!("{}:/opt", arg(&fixture.repo));
     let args: Vec<String> = vec![
         "create".to_owned(),
+        "--track".to_owned(),
         "--discard-unsnapshotted".to_owned(),
         "--add".to_owned(),
         add,
@@ -809,6 +832,7 @@ fn a_from_failure_leaves_the_old_image_tracked() {
     let add = format!("{}:/opt", arg(&fixture.repo));
     let output = ext4kit(&[
         "create",
+        "--track",
         "--discard-unsnapshotted",
         "--add",
         add.as_str(),
@@ -928,11 +952,90 @@ fn dash_leading_subtrees_still_report_dirty_state() {
     fs::write(fixture.repo.join("-dist/a.txt"), "changed\n").unwrap();
     let image = fixture.image("out.img");
     let add = format!("{}:/opt/d", arg(&fixture.repo.join("-dist")));
-    let output = ext4kit(&["create", "--add", add.as_str(), arg(&image).as_str()]);
+    let output = ext4kit(&[
+        "create",
+        "--track",
+        "--add",
+        add.as_str(),
+        arg(&image).as_str(),
+    ]);
     assert!(output.status.success(), "{output:?}");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains("uncommitted changes"), "{stderr}");
     assert_eq!(sidecar(&image)["repos"][0]["dirty_at_create"], true);
+}
+
+#[test]
+fn tracking_is_opt_in() {
+    if !git_ready() {
+        return;
+    }
+    // A repo-sourced create without --track writes an image and nothing
+    // else: no sidecar, no refs.
+    let fixture = fixture(&[("a.txt", "a\n")]);
+    let image = fixture.image("out.img");
+    let add = format!("{}:/opt", arg(&fixture.repo));
+    let output = ext4kit(&["create", "--add", add.as_str(), arg(&image).as_str()]);
+    assert!(output.status.success(), "{output:?}");
+    assert!(!sidecar_exists(&image));
+    let refs = git_stdout(&fixture.repo, &["for-each-ref", "refs/ext4kit/"]);
+    assert_eq!(refs, "");
+
+    // --label and --include-ignored are tracking switches: without
+    // --track they are usage errors.
+    for flags in [&["--label", "x"][..], &["--include-ignored"][..]] {
+        let mut args: Vec<String> = vec!["create".to_owned()];
+        args.extend(flags.iter().map(|flag| (*flag).to_owned()));
+        args.push("--add".to_owned());
+        args.push(add.clone());
+        args.push(arg(&image));
+        let output = ext4kit(&args.iter().map(String::as_str).collect::<Vec<_>>());
+        assert!(!output.status.success(), "{flags:?}: {output:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("--track"), "{flags:?}: {stderr}");
+    }
+}
+
+#[test]
+fn re_creating_without_track_still_gates_and_retires() {
+    if !git_ready() {
+        return;
+    }
+    // The old-image gates and the retirement do not need --track: the
+    // refusal fires without it, and --discard-unsnapshotted retires the
+    // old refs while the new image stays untracked.
+    let fixture = fixture(&[("a.txt", "a\n")]);
+    let image = fixture.image("out.img");
+    create_ok(&fixture.repo, &[], &image);
+    let old_base = base_sha(&fixture.repo, "out");
+
+    let add = format!("{}:/opt", arg(&fixture.repo));
+    let output = ext4kit(&["create", "--add", add.as_str(), arg(&image).as_str()]);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("--discard-unsnapshotted"),
+        "{output:?}"
+    );
+    assert_eq!(base_sha(&fixture.repo, "out"), old_base);
+
+    let output = ext4kit(&[
+        "create",
+        "--discard-unsnapshotted",
+        "--add",
+        add.as_str(),
+        arg(&image).as_str(),
+    ]);
+    assert!(output.status.success(), "{output:?}");
+    let moved = git_stdout(
+        &fixture.repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname)",
+            "refs/ext4kit/out/previous",
+        ],
+    );
+    assert_eq!(moved.lines().count(), 1, "the old refs retired");
+    assert!(!sidecar_exists(&image), "the new image is untracked");
 }
 
 #[test]

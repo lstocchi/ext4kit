@@ -69,14 +69,21 @@ enum Command {
         #[arg(long, value_name = "UID[:GID]", value_parser = parse_owner)]
         root_owner: Option<(u32, u32)>,
 
+        /// Record folder tracking for the --add sources: a sidecar beside
+        /// the image and a baseline commit in each source's repository,
+        /// so an agent's work inside a VM can be reviewed with git.
+        /// Without it, create only writes the image.
+        #[arg(long)]
+        track: bool,
+
         /// Label of the tracked-folder refs (default: the image file
         /// name). Pass one when several images share a basename.
-        #[arg(long, value_name = "LABEL")]
+        #[arg(long, value_name = "LABEL", requires = "track")]
         label: Option<String>,
 
         /// Include gitignored paths in the tracked baseline and in every
         /// snapshot of this image. Fixed per label at create.
-        #[arg(long)]
+        #[arg(long, requires = "track")]
         include_ignored: bool,
 
         /// Re-create over an old tracked image that is mounted or was not
@@ -253,6 +260,7 @@ fn main() -> ExitCode {
             size,
             chown,
             root_owner,
+            track,
             label,
             include_ignored,
             replace_mounted,
@@ -266,6 +274,7 @@ fn main() -> ExitCode {
             chown,
             root_owner,
             TrackingFlags {
+                track,
                 label,
                 include_ignored,
                 replace_mounted,

@@ -34,6 +34,11 @@ pub struct TrackedSource {
 /// callable.
 #[derive(Debug, Default)]
 pub struct TrackingFlags {
+    /// Whether the user asked for tracking at all. Without it nothing
+    /// below the old-image gates runs — no git call, no dirty check, no
+    /// base refs, no sidecar — while the gates and the retirement of an
+    /// existing sidecar keep working.
+    pub track: bool,
     pub label: Option<String>,
     pub include_ignored: bool,
     pub replace_mounted: bool,
@@ -99,6 +104,12 @@ pub fn prepare_tracking(
         );
     }
 
+    if !flags.track {
+        // Tracking is opt-in: without the flag, create only writes the
+        // image. The gates above still ran (they need no git), and an
+        // existing sidecar is still retired by the caller.
+        return Ok((None, old_tracking));
+    }
     if sources.is_empty() {
         // No --add content: nothing to track, but an existing sidecar
         // still has to be retired with its refs.

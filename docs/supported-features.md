@@ -35,10 +35,11 @@ The demonstration image contains:
 
 ## Tracked folders
 
-`create` records folder tracking when every `--add` source is inside a git
-repository and no two additions overlap (image targets or repo-relative host
-paths): a sidecar `<image>.ext4kit-tracked` ties the image's UUID to a label
-and its mappings, and one baseline commit per repository lands on
+`create --track` records folder tracking when every `--add` source is inside
+a git repository and no two additions overlap (image targets or
+repo-relative host paths): a sidecar `<image>.ext4kit-tracked` ties the
+image's UUID to a label and its mappings, and one baseline commit per
+repository lands on
 `refs/ext4kit/<label>/base`, parented on HEAD. The baseline holds exactly the
 imported content — normalized with git's clean-conversion rules (eol
 attributes, `core.autocrlf`, `filter=`/`ident` routes through
@@ -58,10 +59,12 @@ The `ext4kit snapshot` command that turns image state into commits on
 Re-creating over a tracked image keeps the previous baseline refs under
 `refs/ext4kit/<label>/previous/<timestamp>/` and refuses to discard
 unsnapshotted work (or a still-mounted image) without the explicit
-`--discard-unsnapshotted` / `--replace-mounted` overrides. A sidecar whose
-recorded image UUID does not match the image is foreign: it is reported and
-removed, its refs are never moved, and a label it happens to use still
-collides.
+`--discard-unsnapshotted` / `--replace-mounted` overrides — with or without
+`--track`, since those gates protect the old image, not the new one. A
+sidecar whose recorded image UUID does not match the image is foreign: it is
+reported and removed, its refs are never moved, and a label it happens to
+use still collides. Tracking is off by default: a plain `create` writes only
+the image.
 
 ## Metadata API
 

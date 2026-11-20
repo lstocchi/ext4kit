@@ -86,19 +86,20 @@ defaults to the UID.
 
 ### Tracked folders
 
-When every `--add` source lies inside a git repository and no two additions
-overlap, `create` records the mapping beside the image (in
-`<image>.ext4kit-tracked`) and writes a **baseline commit**
-`refs/ext4kit/<label>/base` into each repository, holding exactly what was
-imported, normalized and ignore-filtered like every later snapshot will be.
-A mapping root that cannot be read (replaced by a symlink, or unlistable) is
-skipped rather than deleted, so a read failure never drops the repository's
-content from the baseline; HEAD paths whose names cannot exist on the host
-are kept from HEAD instead of being deleted. The label defaults to the image
-file name; pass `--label` when several images share one.
+Tracking is opt-in: pass `--track` and, when every `--add` source lies inside
+a git repository and no two additions overlap, `create` records the mapping
+beside the image (in `<image>.ext4kit-tracked`) and writes a **baseline
+commit** `refs/ext4kit/<label>/base` into each repository, holding exactly
+what was imported, normalized and ignore-filtered like every later snapshot
+will be. A plain `create` only writes the image. A mapping root that cannot
+be read (replaced by a symlink, or unlistable) is skipped rather than
+deleted, so a read failure never drops the repository's content from the
+baseline; HEAD paths whose names cannot exist on the host are kept from HEAD
+instead of being deleted. The label defaults to the image file name; pass
+`--label` when several images share one.
 
 ```powershell
-cargo run -- create --add C:\work\repo:/opt output.img
+cargo run -- create --track --add C:\work\repo:/opt output.img
 # tracking baseline: refs/ext4kit/output/base -> <sha> in C:/work/repo
 ```
 
@@ -110,11 +111,11 @@ puts gitignored paths into the baseline and every snapshot of the label.
 Re-creating over a tracked image refuses unless the unsnapshotted changes are
 explicitly discarded (`--discard-unsnapshotted`), and never over an image that
 is still mounted (`--replace-mounted` exists only for a VM that crashed or was
-killed); the previous baseline refs are kept under
-`refs/ext4kit/<label>/previous/<timestamp>/`. A sidecar whose recorded image
-UUID does not match the image is foreign (a copied sidecar, a wrapper
-mix-up): it is reported and removed, its refs are never moved, and a label
-it happens to use still collides.
+killed); both refusals hold with or without `--track`, and so does retiring
+the previous baseline refs under `refs/ext4kit/<label>/previous/<timestamp>/`.
+A sidecar whose recorded image UUID does not match the image is foreign (a
+copied sidecar, a wrapper mix-up): it is reported and removed, its refs are
+never moved, and a label it happens to use still collides.
 
 ### Editing an image
 
