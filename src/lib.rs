@@ -11,10 +11,13 @@
 //! - [`vfs`]: name-based access, resolving paths through directories and
 //!   symlinks, and coreutils-style edits.
 //! - [`host`] and [`oci`]: importers for host directories and OCI images.
+//! - [`tracked`]: turning the state of an image into git commits, read
+//!   through [`ext4::reader::ImageReader`].
 
 pub mod ext4;
 pub mod host;
 pub mod oci;
+pub mod tracked;
 pub mod vfs;
 
 pub use ext4::{Ext4ImageBuilder, PosixMetadata};
