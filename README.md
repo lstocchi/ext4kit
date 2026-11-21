@@ -116,7 +116,10 @@ for `--root-owner`.
 
 Use `Ext4ImageBuilder::new_file(size_mib, output)` for file-backed construction.
 `Ext4ImageBuilder::new(size_mib)` remains available when an in-memory image is
-useful, such as small tests.
+useful, such as small tests. The output file is created sparse (automatically on
+Unix via `set_len`, and explicitly via `FSCTL_SET_SPARSE` on Windows), so it only
+occupies the disk blocks that actually hold data and avoids zero-filling the
+entire image.
 
 
 `debugfs` should list `hello.txt` and display its `user.creator` xattr. Images
