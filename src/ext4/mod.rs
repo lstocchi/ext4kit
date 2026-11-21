@@ -79,6 +79,109 @@ impl DerefMut for DiskData {
     }
 }
 
+/// Marks `file` sparse so extending it does not force Windows to zero-fill
+/// the entire image on disk.
+///
+/// On NTFS, extending a normal (dense) file with `set_len` and then writing
+/// near the end forces Windows to physically write zeros across the entire
+/// gap. Because `commit_metadata` writes scattered inode tables across the
+/// image, a dense file wastes time zero-filling the whole file. Marking the
+/// file sparse avoids this: unwritten regions automatically read as zeros
+/// without allocating disk blocks.
+#[cfg(windows)]
+fn mark_file_sparse(file: &std::fs::File) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    const FSCTL_SET_SPARSE: u32 = 0x0009_00c4;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn DeviceIoControl(
+            device: *mut core::ffi::c_void,
+            control_code: u32,
+            in_buffer: *const core::ffi::c_void,
+            in_buffer_size: u32,
+            out_buffer: *mut core::ffi::c_void,
+            out_buffer_size: u32,
+            bytes_returned: *mut u32,
+            overlapped: *mut core::ffi::c_void,
+        ) -> i32;
+    }
+
+    let mut bytes_returned = 0u32;
+    let result = unsafe {
+        DeviceIoControl(
+            file.as_raw_handle().cast(),
+            FSCTL_SET_SPARSE,
+            std::ptr::null(),
+            0,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+    if result == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Returns the bytes `path` occupies on disk, which for a sparse or
+/// compressed file is less than its length; `None` when the file does not
+/// exist or the query fails.
+#[cfg(windows)]
+fn allocated_size(path: &Path) -> Option<u64> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const INVALID_FILE_SIZE: u32 = u32::MAX;
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetCompressedFileSizeW(file_name: *const u16, file_size_high: *mut u32) -> u32;
+    }
+
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().collect();
+    wide.push(0);
+    let mut high = 0u32;
+    let low = unsafe { GetCompressedFileSizeW(wide.as_ptr(), &mut high) };
+    // INVALID_FILE_SIZE is also a legal low word, so only the last error
+    // tells a failure apart from a size whose low 32 bits are all ones.
+    if low == INVALID_FILE_SIZE && std::io::Error::last_os_error().raw_os_error() != Some(0) {
+        return None;
+    }
+    Some((u64::from(high) << 32) | u64::from(low))
+}
+
+/// Returns the bytes available to the user on the volume holding `path`,
+/// or `None` when the query itself fails.
+#[cfg(windows)]
+fn available_space(path: &Path) -> Option<u64> {
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetDiskFreeSpaceExW(
+            directory_name: *const u16,
+            free_bytes_available_to_caller: *mut u64,
+            total_number_of_bytes: *mut u64,
+            total_number_of_free_bytes: *mut u64,
+        ) -> i32;
+    }
+
+    use std::os::windows::ffi::OsStrExt;
+
+    let directory = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => Path::new(".").to_path_buf(),
+    };
+    let mut wide: Vec<u16> = directory.as_os_str().encode_wide().collect();
+    wide.push(0);
+
+    let mut available = 0u64;
+    let mut total = 0u64;
+    let mut total_free = 0u64;
+    let result =
+        unsafe { GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, &mut total, &mut total_free) };
+    (result != 0).then_some(available)
+}
+
 impl Ext4ImageBuilder {
     /// Creates an in-memory ext4 image builder of `size_mb`; returns initialized filesystem state.
     /// A trailing block group without room for its metadata and a few free
@@ -135,12 +238,37 @@ impl Ext4ImageBuilder {
         let geometry = Self::plan_geometry(image_size_bytes / BLOCK_SIZE)
             .map_err(|err| std::io::Error::other(err.to_string()))?;
         let path = output_path.as_ref().to_owned();
+
+        #[cfg(windows)]
+        if let Some(free) = available_space(&path) {
+            let reclaimable = allocated_size(&path).unwrap_or(0);
+            let usable = free.saturating_add(reclaimable);
+            if usable < image_size_bytes as u64 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::StorageFull,
+                    format!(
+                        "not enough space for a {size_mb} MiB image at {}: {} MiB free",
+                        path.display(),
+                        usable / (1024 * 1024)
+                    ),
+                ));
+            }
+        }
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .truncate(true)
             .open(&path)?;
+        // On a filesystem without sparse support the image is
+        // created dense instead, which is correct but slow.
+        #[cfg(windows)]
+        if let Err(err) = mark_file_sparse(&file) {
+            eprintln!(
+                "warning: could not mark {} sparse ({err}); creating it dense is slower",
+                path.display()
+            );
+        }
         file.set_len(image_size_bytes as u64)?;
         // the file remains at its fixed length for the lifetime of the
         // mapping, and all access is mediated through the uniquely owned MmapMut.
@@ -283,6 +411,62 @@ mod tests {
         }
         assert_eq!(std::fs::metadata(&path)?.len(), 16 * 1024 * 1024);
         std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_new_file_backed_image_is_sparse() -> anyhow::Result<()> {
+        let path = std::env::temp_dir().join(format!("ext4kit-sparse-{}.img", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        {
+            let mut builder = Ext4ImageBuilder::new_file(16, &path)?;
+            builder.create_root_dir()?;
+            builder.create_lost_and_found()?;
+            builder.reserve_inodes();
+            builder.write_to_file(path.to_str().unwrap())?;
+        }
+        // A regression to dense files would bring back the whole-image
+        // NTFS zero-fill, making creation time proportional to the image
+        // size instead of the content.
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_SPARSE_FILE: u32 = 0x0000_0200;
+        let attributes = std::fs::metadata(&path)?.file_attributes();
+        assert_ne!(
+            attributes & FILE_ATTRIBUTE_SPARSE_FILE,
+            0,
+            "a created image must be marked sparse"
+        );
+        std::fs::remove_file(path)?;
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn a_refused_image_size_leaves_the_previous_image_intact() -> anyhow::Result<()> {
+        use super::{BLOCK_SIZE, available_space};
+
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("out.img");
+        std::fs::write(&path, b"previous image")?;
+        let Some(free) = available_space(&path) else {
+            return Ok(());
+        };
+        // One GiB past the free space; skip on volumes so large that the
+        // size exceeds what 32-bit block numbers can lay out.
+        let size_mb = (free / (1024 * 1024) + 1024) as usize;
+        if size_mb
+            .checked_mul(1024 * 1024)
+            .map(|bytes| bytes / BLOCK_SIZE)
+            > Some(u32::MAX as usize)
+        {
+            return Ok(());
+        }
+        let err = Ext4ImageBuilder::new_file(size_mb, &path)
+            .err()
+            .expect("an image larger than the free space must be refused");
+        assert_eq!(err.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(std::fs::read(&path)?, b"previous image");
         Ok(())
     }
 

@@ -100,6 +100,16 @@ those made by `mke2fs`, are rejected. The image size is fixed. See
   non-empty one is refused.
 - Sparse files, inline/shared xattrs, and SELinux validation are not
   implemented yet.
+- Created images are sparse files (automatically on Linux, and via NTFS
+  sparse attributes on Windows): they occupy only their written blocks and
+  avoid zero-filling the entire image. The logical size is unchanged and
+  readers (a VM, `e2fsck`, `debugfs`) are unaffected, though copying the
+  image with a tool that does not preserve sparseness expands it to the full
+  size.
+- On Windows, creation also checks free disk space up front and fails
+  before touching any existing image at the output path if the volume lacks
+  room for the full image. (This check does not reserve space, so concurrent
+  disk usage by other processes can still exhaust it.)
 - Host import preserves the portable subset of metadata supported by the host
   OS. OCI import applies layer metadata, whiteouts (including opaque
   directories), and hard links; only linux/amd64 images and anonymous registry
