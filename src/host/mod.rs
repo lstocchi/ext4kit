@@ -1,5 +1,7 @@
-//! Import of a host-directory tree into an ext4 image.
+//! Import of a host-directory tree into an ext4 image, and the git
+//! machinery the tracked-folder layer drives.
 
+pub mod git;
 mod tree;
 
 pub use tree::HostTree;
