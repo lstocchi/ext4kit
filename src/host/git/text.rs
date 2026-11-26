@@ -5,8 +5,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The line-ending statistics git's `gather_stats` collects, and its
 /// binary heuristic: any NUL, a lone CR, or too many non-printables
-/// (non-printables exceeding printables over 128). Feeding chunk by chunk
-/// keeps the CR carry across chunk boundaries exact.
+/// (non-printables exceeding printables over 128), except that a single
+/// DOS EOF (^Z) at the very end of the content is excused. Feeding chunk
+/// by chunk keeps the CR carry across chunk boundaries exact.
 #[derive(Default)]
 pub struct TextStat {
     cr: u64,
@@ -15,6 +16,8 @@ pub struct TextStat {
     printable: u64,
     nonprintable: u64,
     carry_cr: bool,
+    /// The last byte seen, for the trailing-^Z exception.
+    last: Option<u8>,
 }
 
 impl TextStat {
@@ -34,7 +37,9 @@ impl TextStat {
                     }
                 }
                 0x7f => self.nonprintable += 1,
-                // \b, \t, ESC and FF count as printable, like git.
+                // git counts BACKSPACE, TAB, ESC and FORM FEED as
+                // printable; vertical tab and the DOS EOF (^Z) fall
+                // through to non-printable like other control bytes.
                 0x08 | 0x09 | 0x1b | 0x0c => self.printable += 1,
                 byte if byte < 32 => {
                     if byte == 0 {
@@ -45,12 +50,25 @@ impl TextStat {
                 _ => self.printable += 1,
             }
             self.carry_cr = byte == b'\r';
+            self.last = Some(byte);
         }
     }
 
     pub fn is_binary(&self) -> bool {
         let lone_cr = self.cr - self.crlf;
-        self.nul || lone_cr > 0 || (self.printable >> 7) < self.nonprintable
+        // git excuses a single DOS EOF (^Z) at the very end of the
+        // content: `gather_stats` decrements the non-printable count for
+        // it after the loop.
+        let trailing_eof = if self.last == Some(0x1a) { 1 } else { 0 };
+        let nonprintable = self.nonprintable.saturating_sub(trailing_eof);
+        self.nul || lone_cr > 0 || (self.printable >> 7) < nonprintable
+    }
+
+    /// Whether a reference blob suppresses an auto conversion, git's
+    /// `has_crlf_in_index`: not binary and carrying CRLF (the `i/crlf` and
+    /// `i/mixed` cases).
+    pub fn reference_has_crlf(&self) -> bool {
+        !self.is_binary() && self.has_crlf()
     }
 
     pub fn has_crlf(&self) -> bool {
@@ -69,12 +87,10 @@ pub fn is_binary(content: &[u8]) -> bool {
     TextStat::gather(content).is_binary()
 }
 
-/// Whether a reference blob suppresses an auto conversion, git's
-/// `has_crlf_in_index`: not binary and carrying CRLF (the `i/crlf` and
-/// `i/mixed` cases).
+/// Whether a reference blob suppresses an auto conversion; the same rule
+/// as [`TextStat::reference_has_crlf`], over content.
 pub fn reference_has_crlf(content: &[u8]) -> bool {
-    let stats = TextStat::gather(content);
-    !stats.is_binary() && stats.has_crlf()
+    TextStat::gather(content).reference_has_crlf()
 }
 
 /// Strips the CR of every CRLF pair, git's `crlf_to_git` output step.
@@ -283,6 +299,23 @@ mod tests {
         let mut too_dirty = vec![b'a'; 128];
         too_dirty[50] = 0x01;
         assert!(is_binary(&too_dirty));
+    }
+
+    #[test]
+    fn the_binary_heuristic_matches_gits_control_byte_classes() {
+        // BACKSPACE, TAB, ESC and FORM FEED are printables to git.
+        assert!(!is_binary(b"a\x08\x09\x1b\x0cb"));
+        // Vertical tab is a nonprintable.
+        assert!(is_binary(b"a\x0bb"));
+        // A ^Z at the very end is a DOS EOF, not a nonprintable; in the
+        // middle it is one.
+        assert!(!is_binary(b"hello\r\n\x1a"));
+        assert!(is_binary(b"hel\x1alo"));
+        // The last-byte exception survives chunked feeding.
+        let mut stats = TextStat::default();
+        stats.feed(b"hello\r\n");
+        stats.feed(b"\x1a");
+        assert!(!stats.is_binary());
     }
 
     #[test]
