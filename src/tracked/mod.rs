@@ -8,6 +8,7 @@
 //! [`names::validate_component`] before they become git paths; see the
 //! snapshot plan's threat model.
 
+pub mod commit;
 pub mod names;
 pub mod scan;
 pub mod sidecar;
