@@ -347,6 +347,11 @@ impl Ext4Inode {
     pub fn is_dir(&self) -> bool {
         self.file_type() == S_IFDIR
     }
+
+    /// Returns the inode's size from `i_size_lo` and `i_size_high`.
+    pub fn file_size(&self) -> u64 {
+        u64::from(self.i_size_lo) | (u64::from(self.i_size_high) << 32)
+    }
 }
 
 #[cfg(test)]
