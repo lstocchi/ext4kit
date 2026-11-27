@@ -290,6 +290,23 @@ impl Repo {
         Ok(output.status.success() && !String::from_utf8_lossy(&output.stdout).trim().is_empty())
     }
 
+    /// Paths that differ between two commits, as lossy UTF-8 (`git diff
+    /// --name-only -z`). Advisory only: a path that is not valid UTF-8 is
+    /// lossily rendered and never matches the ASCII high-risk names.
+    pub fn changed_paths(&self, from: &str, to: &str) -> Result<Vec<String>> {
+        let output = ensure_success(
+            run(&self.root, &["diff", "--name-only", "-z", from, to])?,
+            "git diff failed",
+            &self.root,
+        )?;
+        Ok(output
+            .stdout
+            .split(|&byte| byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| String::from_utf8_lossy(path).into_owned())
+            .collect())
+    }
+
     /// Which of `entries` — `(mode, sha, raw path)` triples — git itself
     /// accepts as index paths on this host. `fast-import` validates every
     /// path with git's `verify_path`, which on some hosts (Windows)
@@ -383,8 +400,14 @@ impl TreeEntry {
 /// the carry-forward rule.
 #[derive(Clone, Debug, Default)]
 pub struct ParentTree {
-    /// Every entry, keyed by path.
+    /// One entry per lossy path, for lookups and display. Two distinct raw
+    /// paths can render to the same string when a name is not valid UTF-8,
+    /// so a lookup answers "a HEAD entry exists here", not "this exact
+    /// entry does"; use [`Self::listing`] when every entry must be visited.
     pub entries: HashMap<String, TreeEntry>,
+    /// Every record of the listing in `ls-tree` order, including the
+    /// distinct raw paths `entries` collapses onto one lossy key.
+    pub listing: Vec<TreeEntry>,
     /// Directory prefixes that contain tracked content.
     pub tracked_prefixes: Vec<String>,
 }
@@ -396,12 +419,13 @@ impl ParentTree {
             .filter(|entry| entry.is_tree())
             .map(|entry| entry.path.clone())
             .collect();
-        let entries = entries
-            .into_iter()
-            .map(|entry| (entry.path.clone(), entry))
+        let by_path = entries
+            .iter()
+            .map(|entry| (entry.path.clone(), entry.clone()))
             .collect();
         Self {
-            entries,
+            entries: by_path,
+            listing: entries,
             tracked_prefixes,
         }
     }
@@ -518,6 +542,23 @@ mod tests {
         let tree = ParentTree::from_entries(entries);
         assert!(tree.has_tracked_descendants("build"));
         assert!(!tree.has_tracked_descendants("node_modules"));
+    }
+
+    #[test]
+    fn the_listing_keeps_raw_paths_the_lossy_map_collapses() {
+        // Two names that are not valid UTF-8 render to the same lossy
+        // path. The map keeps one (for lookups); the listing keeps both,
+        // so neither HEAD entry is lost when the tree is re-emitted.
+        let entry = |raw: &[u8]| TreeEntry {
+            mode: "100644".into(),
+            kind: "blob".into(),
+            sha: "1".into(),
+            path: String::from_utf8_lossy(raw).into_owned(),
+            raw_path: raw.to_vec(),
+        };
+        let tree = ParentTree::from_entries(vec![entry(b"caf\xe9"), entry(b"caf\xea")]);
+        assert_eq!(tree.entries.len(), 1);
+        assert_eq!(tree.listing.len(), 2);
     }
 
     #[test]
